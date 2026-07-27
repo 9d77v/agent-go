@@ -12,12 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mark3labs/mcp-go/client"
-	"github.com/mark3labs/mcp-go/client/transport"
-	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
-
-var GlobalMCPManager *Manager
 
 type Manager struct {
 	mu              sync.RWMutex
@@ -30,12 +26,13 @@ type Manager struct {
 }
 
 type serverInst struct {
-	config MCPServerConfig
-	client *client.Client
-	status ServerStatus
-	tools  []MCPTool
-	err    string
-	cancel context.CancelFunc
+	config  MCPServerConfig
+	session *mcp.ClientSession
+	client  *mcp.Client
+	status  ServerStatus
+	tools   []MCPTool
+	err     string
+	cancel  context.CancelFunc
 }
 
 func NewManager() *Manager {
@@ -210,12 +207,12 @@ func (m *Manager) startServer(ctx context.Context, cfg *MCPServerConfig) (err er
 		}
 	}
 	cctx, cancel := context.WithCancel(ctx)
-	var cl *client.Client
+	var session *mcp.ClientSession
 	var tools []MCPTool
 	var startErr error
 	switch cfg.Transport {
 	case TransportStdio:
-		cl, tools, startErr = m.connectStdio(cctx, cfg)
+		session, tools, startErr = m.connectStdio(cctx, cfg)
 	default:
 		startErr = fmt.Errorf("不支持的传输类型: %s", cfg.Transport)
 	}
@@ -227,7 +224,7 @@ func (m *Manager) startServer(ctx context.Context, cfg *MCPServerConfig) (err er
 		return startErr
 	}
 	m.mu.Lock()
-	m.servers[cfg.ID] = &serverInst{config: *cfg, client: cl, status: StatusRunning, tools: tools, cancel: cancel}
+	m.servers[cfg.ID] = &serverInst{config: *cfg, session: session, status: StatusRunning, tools: tools, cancel: cancel}
 	m.mu.Unlock()
 	// 如果配置了 HTTP 服务地址，自动注册到统一代理
 	if cfg.URL != "" && m.HTTPProxy != nil {
@@ -240,24 +237,15 @@ func (m *Manager) startServer(ctx context.Context, cfg *MCPServerConfig) (err er
 	return nil
 }
 
-func (m *Manager) connectStdio(ctx context.Context, cfg *MCPServerConfig) (*client.Client, []MCPTool, error) {
-	stdioOpts := []transport.StdioOption{
-		transport.WithCommandFunc(func(ctx context.Context, command string, env []string, args []string) (*exec.Cmd, error) {
-			return newCommand(command, args, env), nil
-		}),
+func (m *Manager) connectStdio(ctx context.Context, cfg *MCPServerConfig) (*mcp.ClientSession, []MCPTool, error) {
+	cmd := newCommand(cfg.Command, cfg.Args, cfg.Env)
+	transport := &mcp.CommandTransport{Command: cmd}
+	cl := mcp.NewClient(&mcp.Implementation{Name: m.clientName, Version: m.clientVersion}, nil)
+	session, err := cl.Connect(ctx, transport, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("连接失败: %w", err)
 	}
-	trans := transport.NewStdioWithOptions(cfg.Command, cfg.Env, cfg.Args, stdioOpts...)
-	if err := trans.Start(ctx); err != nil {
-		return nil, nil, fmt.Errorf("启动子进程失败: %w", err)
-	}
-	cl := client.NewClient(trans)
-	initReq := mcp.InitializeRequest{}
-	initReq.Params.ProtocolVersion = "2024-11-05"
-	initReq.Params.ClientInfo = mcp.Implementation{Name: m.clientName, Version: m.clientVersion}
-	if _, err := cl.Initialize(ctx, initReq); err != nil {
-		return nil, nil, fmt.Errorf("初始化失败: %w", err)
-	}
-	toolsResult, err := cl.ListTools(ctx, mcp.ListToolsRequest{})
+	toolsResult, err := session.ListTools(ctx, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("获取工具列表失败: %w", err)
 	}
@@ -265,7 +253,7 @@ func (m *Manager) connectStdio(ctx context.Context, cfg *MCPServerConfig) (*clie
 	for _, t := range toolsResult.Tools {
 		mcpTools = append(mcpTools, MCPTool{ServerID: cfg.ID, ServerName: cfg.Name, Name: t.Name, Description: t.Description, InputSchema: t.InputSchema})
 	}
-	return cl, mcpTools, nil
+	return session, mcpTools, nil
 }
 
 func (m *Manager) Stop(id string) {
@@ -335,9 +323,6 @@ func (m *Manager) CallTool(ctx context.Context, serverID string, toolName string
 	if !ok {
 		return nil, fmt.Errorf("MCP 服务器 %s 未运行", serverID)
 	}
-	req := mcp.CallToolRequest{}
-	req.Params.Name = toolName
-	req.Params.Arguments = args
 	// 如果父 context 已有截止时间则直接使用，否则加 30 秒默认超时
 	var cctx context.Context
 	var cancel context.CancelFunc
@@ -348,11 +333,11 @@ func (m *Manager) CallTool(ctx context.Context, serverID string, toolName string
 		cctx, cancel = context.WithTimeout(ctx, 30*time.Second)
 	}
 	defer cancel()
-	result, err = inst.client.CallTool(cctx, req)
+	res, err := inst.session.CallTool(cctx, &mcp.CallToolParams{Name: toolName, Arguments: args})
 	if err != nil {
 		return nil, fmt.Errorf("调用工具 %s/%s 失败: %w", serverID, toolName, err)
 	}
-	return result, nil
+	return res, nil
 }
 
 func (m *Manager) BuildToolDefinitions(toolEnabled func(name string) bool) []map[string]any {
@@ -423,3 +408,6 @@ func newCommand(command string, args []string, env []string) *exec.Cmd {
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	return cmd
 }
+
+// GlobalMCPManager 全局 MCP 管理器实例
+var GlobalMCPManager *Manager
