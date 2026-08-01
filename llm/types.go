@@ -9,11 +9,18 @@ type ChatRequest struct {
 	Thinking          string
 	Tools             bool
 	ContextWindow     int
+
+	// 网络/协议参数（由调用方填充，LLMService 据此发起请求）
+	ProviderType    string // "openai" / "anthropic" / "gemini"
+	BaseURL         string // 完整 base url（如 https://api.deepseek.com）
+	APIKey          string
+	UseResponsesAPI bool                   // true → /responses，false → /chat/completions
+	ToolDefs        []OpenAIToolDefinition // 流式请求的工具定义（可选）
 }
 type ModelInfo struct {
-	ID        string
-	CreatedAt int64
-	OwnedBy   string
+	ID        string `json:"id"`
+	CreatedAt int64  `json:"created"`
+	OwnedBy   string `json:"owned_by"`
 }
 type ToolCallInfo struct {
 	ID, Type string

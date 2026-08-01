@@ -3,5 +3,6 @@
 package credential
 
 func winCredWrite(target, userName, secret string) error { return nil }
-func winCredRead(target string) (string, error) { return "", nil }
-func winCredDelete(target string) error { return nil }
+func winCredRead(target string) (string, error)          { return "", nil }
+func winCredDelete(target string) error                  { return nil }
+func winCredEnumerate(prefix string) ([]string, error)   { return nil, nil }

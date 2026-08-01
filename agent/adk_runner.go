@@ -1,4 +1,5 @@
-// Package agent provides the ADK-Go wrapper for Wails desktop applications.
+// Package agent provides the ADK-Go wrapper for ADK agents.
+// 通用框架层：封装 ADK Runner，适用于桌面端与服务端场景。
 package agent
 
 import (
@@ -7,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"google.golang.org/adk/v2/agent"
+	adkagent "google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/genai"
@@ -21,7 +22,7 @@ type AdkRunnerConfig struct {
 	AppName string
 
 	// Agent ADK Agent 实例（由调用方通过 llmagent.New 等创建）。
-	Agent agent.Agent
+	Agent adkagent.Agent
 
 	// SessionService 会话持久化服务。
 	SessionService session.Service
@@ -85,11 +86,12 @@ func (r *AdkRunner) Run(
 		callbacks.OnMessageStart(msgID, seq, turnID, "model")
 	}
 
-	events := r.runner.Run(ctx, userID, sessionID, content, agent.RunConfig{})
+	events := r.runner.Run(ctx, userID, sessionID, content, adkagent.RunConfig{})
 
 	var totalContent strings.Builder
 	iterCount := 0
 	hasError := false
+	msgHasModelParts := false
 
 	for event, err := range events {
 		if err != nil {
@@ -102,6 +104,7 @@ func (r *AdkRunner) Run(
 
 		iterCount++
 		if r.config.MaxIterations > 0 && iterCount > r.config.MaxIterations {
+			hasError = true
 			if callbacks.OnError != nil {
 				callbacks.OnError(msgID, "max_iterations", "达到最大迭代次数限制")
 			}
@@ -110,6 +113,35 @@ func (r *AdkRunner) Run(
 
 		if event.Content == nil {
 			continue
+		}
+
+		// 判断该事件是否为"模型响应"（含思考/文本/函数调用）；工具结果事件不含这些
+		isModelEvent := false
+		for _, part := range event.Content.Parts {
+			if part == nil {
+				continue
+			}
+			if part.Text != "" || part.FunctionCall != nil {
+				isModelEvent = true
+				break
+			}
+		}
+
+		// 按子响应拆分消息：每个新的模型响应开启一条新消息，
+		// 与历史消息（每条 = 一段思考 + 若干工具调用）保持一致。
+		// 工具结果事件不拆分，归入发起该调用所在子响应的消息。
+		if isModelEvent && msgHasModelParts {
+			if callbacks.OnMessageEnd != nil {
+				callbacks.OnMessageEnd(msgID)
+			}
+			seq++
+			msgID = fmt.Sprintf("msg_%d_%d", time.Now().UnixNano(), seq)
+			if callbacks.OnMessageStart != nil {
+				callbacks.OnMessageStart(msgID, seq, turnID, "model")
+			}
+		}
+		if isModelEvent {
+			msgHasModelParts = true
 		}
 
 		// 处理 Content Parts
@@ -162,16 +194,7 @@ func (r *AdkRunner) Run(
 				if callbacks.OnToolResult != nil {
 					callbacks.OnToolResult(callID, toolMsgID, result)
 				}
-
-				// 工具结果发完后再关闭旧消息、开启新消息
-				if callbacks.OnMessageEnd != nil {
-					callbacks.OnMessageEnd(msgID)
-				}
-				seq++
-				msgID = fmt.Sprintf("msg_%d_%d", time.Now().UnixNano(), seq)
-				if callbacks.OnMessageStart != nil {
-					callbacks.OnMessageStart(msgID, seq, turnID, "model")
-				}
+				// 工具结果事件不拆分消息，归入发起该调用所在子响应的消息。
 			}
 		}
 

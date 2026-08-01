@@ -1,4 +1,5 @@
-// Package agent provides the ADK-Go wrapper for Wails desktop applications.
+// Package agent provides the ADK-Go wrapper for ADK agents.
+// 通用框架层：封装 ADK Runner + 审批系统，适用于桌面端与服务端场景。
 package agent
 
 import (
@@ -8,10 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/adk/v2/agent"
+	adkagent "google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/model"
-	"google.golang.org/adk/v2/model/openaimodel"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
 
@@ -22,8 +22,8 @@ import (
 // 设为 true 时，SetModel 会自动切换到 ChatModel 适配器。
 var DefaultUseChatAPI = true
 
-// WailsAgentConfig WailsAgent 配置。
-type WailsAgentConfig struct {
+// AgentConfig Agent 配置。
+type AgentConfig struct {
 	// AppName 应用标识（框架层不感知具体含义，调用方自行编码 workspace_id）。
 	AppName string
 
@@ -40,10 +40,10 @@ type WailsAgentConfig struct {
 	ApprovalTimeout time.Duration
 }
 
-// WailsAgent Wails 桌面应用的 Agent 外观。
-// 封装 ADK-Go Runner + 审批系统，供 Wails 桌面应用使用。
-type WailsAgent struct {
-	config       WailsAgentConfig
+// Agent 通用 Agent 编排外观。
+// 封装 ADK-Go Runner + 审批系统，适用于桌面端与服务端场景。
+type Agent struct {
+	config       AgentConfig
 	adkRunner    *AdkRunner
 	currentLLM   model.LLM
 	tools        []tool.Tool
@@ -57,13 +57,13 @@ type WailsAgent struct {
 	approvalTimeout       time.Duration
 }
 
-// NewWailsAgent 创建 WailsAgent。
-func NewWailsAgent(cfg WailsAgentConfig) *WailsAgent {
+// NewAgent 创建 Agent。
+func NewAgent(cfg AgentConfig) *Agent {
 	timeout := cfg.ApprovalTimeout
 	if timeout == 0 {
 		timeout = 5 * time.Minute
 	}
-	return &WailsAgent{
+	return &Agent{
 		config:                cfg,
 		pendingApprovals:      make(map[string]chan ApprovalResult),
 		pendingQuestionnaires: make(map[string]chan string),
@@ -73,68 +73,65 @@ func NewWailsAgent(cfg WailsAgentConfig) *WailsAgent {
 
 // SetModel 设置当前使用的 LLM 模型（使用标准 OpenAI Chat Completions API）。
 // 兼容 DeepSeek、Ollama、vLLM 等所有 /v1/chat/completions 兼容的提供商。
-func (w *WailsAgent) SetModel(_ context.Context, apiKey, baseURL, modelName string) error {
-	w.currentLLM = NewChatModel(modelName, apiKey, baseURL)
+func (a *Agent) SetModel(_ context.Context, apiKey, baseURL, modelName string) error {
+	a.currentLLM = NewChatModel(modelName, apiKey, baseURL)
 	return nil
 }
 
-// SetResponsesModel 设置使用 OpenAI Responses API 的模型（仅 OpenAI 原生支持）。
-// 大多数第三方提供商（DeepSeek、Ollama 等）不支持 Responses API，请使用 SetModel。
-func (w *WailsAgent) SetResponsesModel(ctx context.Context, apiKey, baseURL, modelName string) error {
-	llm, err := openaimodel.NewModel(ctx, modelName, &openaimodel.ClientConfig{
-		APIKey:  apiKey,
-		BaseURL: baseURL,
-	})
+// SetResponsesModel 设置使用 OpenAI Responses API 的模型（/v1/responses）。
+// 支持 OpenAI 原生及已兼容 Responses API 的提供商（如 DeepSeek）。
+func (a *Agent) SetResponsesModel(ctx context.Context, apiKey, baseURL, modelName string) error {
+	rm, err := NewResponsesModel(ctx, modelName, apiKey, baseURL)
 	if err != nil {
-		return fmt.Errorf("create responses model: %w", err)
+		return err
 	}
-	w.currentLLM = llm
+	a.currentLLM = rm
 	return nil
 }
 
 // SetTools 设置 Agent 可用的工具列表。
-func (w *WailsAgent) SetTools(tools []tool.Tool) {
-	w.tools = tools
+func (a *Agent) SetTools(tools []tool.Tool) {
+	a.tools = tools
 }
 
 // SetInstruction 设置 Agent 的 system instruction。
-func (w *WailsAgent) SetInstruction(instruction string) {
-	w.instruction = instruction
+func (a *Agent) SetInstruction(instruction string) {
+	a.instruction = instruction
 }
 
 // SetThinking 设置思考模式。会在下一次 BuildAndRun 时生效。
-func (w *WailsAgent) SetThinking(mode string) {
-	w.thinkingMode = mode
-	if cm, ok := w.currentLLM.(*ChatModel); ok {
+func (a *Agent) SetThinking(mode string) {
+	a.thinkingMode = mode
+	if cm, ok := a.currentLLM.(*ChatModel); ok {
 		cm.SetThinkingMode(mode)
 	}
 }
 
 // BuildAndRun 构建 ADK Agent 并运行对话。
 // callbacks 用于接收流式事件。
-func (w *WailsAgent) BuildAndRun(
+func (a *Agent) BuildAndRun(
 	ctx context.Context,
 	userID, sessionID, message string,
 	callbacks *OrchestratorCallbacks,
 	approvalMode ftool.ApprovalMode,
 ) error {
-	if w.currentLLM == nil {
+	if a.currentLLM == nil {
 		return fmt.Errorf("model not set, call SetModel first")
 	}
 
 	// 构建 before tool callback（审批系统集成）
 	var beforeToolCallbacks []llmagent.BeforeToolCallback
 	if approvalMode != ftool.ApprovalModeAuto {
-		beforeToolCallbacks = append(beforeToolCallbacks, w.createApprovalCallback(callbacks, approvalMode))
+		beforeToolCallbacks = append(beforeToolCallbacks, a.createApprovalCallback(callbacks, approvalMode))
 	}
 
 	// 创建 LLM Agent
 	agt, err := llmagent.New(llmagent.Config{
 		Name:                "main",
 		Description:         "主 Agent",
-		Model:               w.currentLLM,
-		Instruction:         w.instruction,
-		Tools:               w.tools,
+		Model:               a.currentLLM,
+		Instruction:         a.instruction,
+		Tools:               a.tools,
 		BeforeToolCallbacks: beforeToolCallbacks,
 	})
 	if err != nil {
@@ -143,23 +140,23 @@ func (w *WailsAgent) BuildAndRun(
 
 	// 创建 AdkRunner 并运行
 	runner, err := NewAdkRunner(AdkRunnerConfig{
-		AppName:        w.config.AppName,
+		AppName:        a.config.AppName,
 		Agent:          agt,
-		SessionService: w.config.SessionService,
-		MaxIterations:  w.config.MaxIterations,
+		SessionService: a.config.SessionService,
+		MaxIterations:  a.config.MaxIterations,
 	})
 	if err != nil {
 		return fmt.Errorf("create runner: %w", err)
 	}
 
-	w.adkRunner = runner
+	a.adkRunner = runner
 	return runner.Run(ctx, userID, sessionID, message, callbacks)
 }
 
 // createApprovalCallback 创建审批回调。
 // 根据 approvalMode 决定是否需要对工具调用进行审批。
-func (w *WailsAgent) createApprovalCallback(callbacks *OrchestratorCallbacks, mode ftool.ApprovalMode) llmagent.BeforeToolCallback {
-	return func(ctx agent.Context, t tool.Tool, args map[string]any) (map[string]any, error) {
+func (a *Agent) createApprovalCallback(callbacks *OrchestratorCallbacks, mode ftool.ApprovalMode) llmagent.BeforeToolCallback {
+	return func(ctx adkagent.Context, t tool.Tool, args map[string]any) (map[string]any, error) {
 		// 获取工具的风险级别
 		risk := ftool.RiskSafe
 		if mode == ftool.ApprovalModeManual {
@@ -176,9 +173,9 @@ func (w *WailsAgent) createApprovalCallback(callbacks *OrchestratorCallbacks, mo
 		command := fmt.Sprintf("%s: %v", t.Name(), args)
 
 		ch := make(chan ApprovalResult, 1)
-		w.approvalMu.Lock()
-		w.pendingApprovals[approvalID] = ch
-		w.approvalMu.Unlock()
+		a.approvalMu.Lock()
+		a.pendingApprovals[approvalID] = ch
+		a.approvalMu.Unlock()
 
 		if callbacks.OnApprovalRequired != nil {
 			callbacks.OnApprovalRequired(approvalID, "", command, risk)
@@ -191,23 +188,23 @@ func (w *WailsAgent) createApprovalCallback(callbacks *OrchestratorCallbacks, mo
 				return nil, fmt.Errorf("用户拒绝了此操作")
 			}
 			return nil, nil // 已批准，继续执行
-		case <-time.After(w.approvalTimeout):
-			w.approvalMu.Lock()
-			delete(w.pendingApprovals, approvalID)
-			w.approvalMu.Unlock()
+		case <-time.After(a.approvalTimeout):
+			a.approvalMu.Lock()
+			delete(a.pendingApprovals, approvalID)
+			a.approvalMu.Unlock()
 			return nil, fmt.Errorf("审批超时")
 		}
 	}
 }
 
 // ResolveApproval 处理审批结果。
-func (w *WailsAgent) ResolveApproval(approvalID string, approved bool) {
-	w.approvalMu.Lock()
-	ch, ok := w.pendingApprovals[approvalID]
+func (a *Agent) ResolveApproval(approvalID string, approved bool) {
+	a.approvalMu.Lock()
+	ch, ok := a.pendingApprovals[approvalID]
 	if ok {
-		delete(w.pendingApprovals, approvalID)
+		delete(a.pendingApprovals, approvalID)
 	}
-	w.approvalMu.Unlock()
+	a.approvalMu.Unlock()
 
 	if ok {
 		select {
@@ -218,13 +215,13 @@ func (w *WailsAgent) ResolveApproval(approvalID string, approved bool) {
 }
 
 // ResolveQuestionnaire 处理问卷结果。
-func (w *WailsAgent) ResolveQuestionnaire(questionnaireID string, answer string) {
-	w.approvalMu.Lock()
-	ch, ok := w.pendingQuestionnaires[questionnaireID]
+func (a *Agent) ResolveQuestionnaire(questionnaireID string, answer string) {
+	a.approvalMu.Lock()
+	ch, ok := a.pendingQuestionnaires[questionnaireID]
 	if ok {
-		delete(w.pendingQuestionnaires, questionnaireID)
+		delete(a.pendingQuestionnaires, questionnaireID)
 	}
-	w.approvalMu.Unlock()
+	a.approvalMu.Unlock()
 
 	if ok {
 		select {
@@ -235,10 +232,7 @@ func (w *WailsAgent) ResolveQuestionnaire(questionnaireID string, answer string)
 }
 
 // SetSubApprovalCallback 设置子 Agent 审批回调（兼容旧接口）。
-func (w *WailsAgent) SetSubApprovalCallback(cb func(approvalID, command string, riskLevel ftool.RiskLevel)) {
+func (a *Agent) SetSubApprovalCallback(cb func(approvalID, command string, riskLevel ftool.RiskLevel)) {
 	// 当前简化实现：子 Agent 审批通过主审批系统处理
-	log.Printf("[WailsAgent] SetSubApprovalCallback called")
+	log.Printf("[Agent] SetSubApprovalCallback called")
 }
-
-// Ensure interface compliance
-var _ agent.Agent

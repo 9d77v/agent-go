@@ -137,6 +137,95 @@ func (s *DBService) DeleteADKEvents(sessionID string) error {
 	return db.Where("session_id = ?", sessionID).Delete(&adkEvent{}).Error
 }
 
+// RepairDanglingSession 修复会话末尾可能存在的悬空 tool call。
+// 典型场景：达到最大迭代次数中断时，ADK 已把含 FunctionCall 的模型响应写入会话，
+// 但对应的 FunctionResponse 尚未产出，导致后续继续执行（continue 或发新消息）时
+// Responses API 报 "No tool output found for tool call ..."。
+// 策略：回滚到最后一个"所有 tool call 均已补齐"的安全点，删除其后所有事件。
+// 返回删除的事件数；会话完整或无法定位安全点时返回 0（不删任何数据）。
+func (s *DBService) RepairDanglingSession(sessionID string) (int, error) {
+	adkPath := filepath.Join(filepath.Dir(s.dbPath), "adk_sessions.db")
+
+	type eventRow struct {
+		ID      string `gorm:"column:id"`
+		Content []byte `gorm:"column:content"`
+		RowID   int64  `gorm:"column:rowid"`
+	}
+
+	ro := s.adkDBConn()
+	if ro == nil {
+		return 0, nil
+	}
+	var rows []eventRow
+	if err := ro.Raw(
+		"SELECT id, content, rowid FROM events WHERE session_id = ? ORDER BY rowid ASC", sessionID,
+	).Scan(&rows).Error; err != nil {
+		_ = closeDB(ro)
+		return 0, err
+	}
+	_ = closeDB(ro)
+
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	pending := make(map[string]bool) // 尚未获得对应工具输出的 tool call ID
+	var lastSafeRowID int64
+	for _, r := range rows {
+		if len(r.Content) == 0 {
+			continue
+		}
+		var c genai.Content
+		if json.Unmarshal(r.Content, &c) != nil {
+			continue
+		}
+		for _, part := range c.Parts {
+			if part == nil {
+				continue
+			}
+			if part.FunctionCall != nil && part.FunctionCall.ID != "" {
+				pending[part.FunctionCall.ID] = true
+			}
+			if part.FunctionResponse != nil && part.FunctionResponse.ID != "" {
+				delete(pending, part.FunctionResponse.ID)
+			}
+		}
+		// 处理完该事件后若所有调用均已补齐，则记录为安全点
+		if len(pending) == 0 {
+			lastSafeRowID = r.RowID
+		}
+	}
+
+	if len(pending) == 0 || lastSafeRowID == 0 {
+		// 会话完整，或无法定位安全点（保守起见不删，避免清空会话）
+		return 0, nil
+	}
+
+	rw, err := gorm.Open(sqlite.Open(adkPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"), &gorm.Config{})
+	if err != nil {
+		return 0, err
+	}
+	defer closeDB(rw)
+
+	res := rw.Where("session_id = ? AND rowid > ?", sessionID, lastSafeRowID).Delete(&adkEvent{})
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	return int(res.RowsAffected), nil
+}
+
+// closeDB closes the underlying *sql.DB of a *gorm.DB, ignoring errors.
+func closeDB(db *gorm.DB) error {
+	if db == nil {
+		return nil
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Close()
+}
+
 // ListADKSessions returns sessions filtered by app name from the ADK database.
 func (s *DBService) ListADKSessions(appName string) ([]Session, error) {
 	db := s.adkDBConn()

@@ -3,6 +3,7 @@ package llm
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // ---------- OpenAI 兼容内部类型 ----------
@@ -123,10 +124,10 @@ func BuildOpenAIStreamRequest(req *ChatRequest, tools []OpenAIToolDefinition) (m
 		msgs = append(msgs, msg)
 	}
 	body := map[string]any{
-		"model":       req.Model,
-		"messages":    msgs,
-		"temperature": req.Temperature,
-		"stream":      true,
+		"model":          req.Model,
+		"messages":       msgs,
+		"temperature":    req.Temperature,
+		"stream":         true,
 		"stream_options": map[string]any{"include_usage": true},
 	}
 	if len(tools) > 0 {
@@ -181,8 +182,10 @@ func BuildGeminiRequest(req *ChatRequest) map[string]any {
 			Text string `json:"text"`
 		}{Text: m.Content}
 		contents = append(contents, GeminiContent{
-			Role:  role,
-			Parts: []struct{ Text string `json:"text"` }{part},
+			Role: role,
+			Parts: []struct {
+				Text string `json:"text"`
+			}{part},
 		})
 	}
 	return map[string]any{"contents": contents}
@@ -244,5 +247,134 @@ func ParseGeminiResponse(body []byte) (*ChatResponse, error) {
 		}
 	}
 	result.Usage = geminiResp.UsageMetadata
+	return result, nil
+}
+
+// ---------- OpenAI Responses API ----------
+
+// BuildOpenAIResponsesRequest 构建 OpenAI Responses API (/responses) 的请求体。
+// 将 ChatRequest 的 messages 转换为 responses input 格式：
+// user/assistant 文本消息、assistant 工具调用、function_call_output 工具结果、system → instructions。
+func BuildOpenAIResponsesRequest(req *ChatRequest) (map[string]any, error) {
+	var instructions []string
+	input := make([]map[string]any, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		switch {
+		case m.Role == "system":
+			if m.Content != "" {
+				instructions = append(instructions, m.Content)
+			}
+		case m.Role == "tool" && m.ToolCallID != "":
+			// 工具执行结果
+			input = append(input, map[string]any{
+				"type":    "function_call_output",
+				"call_id": m.ToolCallID,
+				"output":  m.Content,
+			})
+		case (m.Role == "assistant" || m.Role == "agent") && len(m.ToolCalls) > 0:
+			// assistant 携带工具调用（多轮）
+			content := []map[string]any{}
+			if m.Content != "" {
+				content = append(content, map[string]any{"type": "output_text", "text": m.Content})
+			}
+			for _, tc := range m.ToolCalls {
+				content = append(content, map[string]any{
+					"type":      "function_call",
+					"id":        tc.ID,
+					"name":      tc.Function.Name,
+					"arguments": tc.Function.Arguments,
+				})
+			}
+			item := map[string]any{"role": "assistant", "content": content}
+			if m.ReasoningContent != "" {
+				item["reasoning"] = []map[string]any{{"type": "summary_text", "text": m.ReasoningContent}}
+			}
+			input = append(input, item)
+		default:
+			role := m.Role
+			if role == "agent" {
+				role = "assistant"
+			}
+			input = append(input, map[string]any{"role": role, "content": m.Content})
+		}
+	}
+
+	body := map[string]any{
+		"model": req.Model,
+		"input": input,
+	}
+	if req.Stream {
+		body["stream"] = true
+	}
+	if req.Temperature != 0 {
+		body["temperature"] = req.Temperature
+	}
+	if len(instructions) > 0 {
+		body["instructions"] = strings.Join(instructions, "\n")
+	}
+	if len(req.ToolDefs) > 0 {
+		tools := make([]map[string]any, 0, len(req.ToolDefs))
+		for _, td := range req.ToolDefs {
+			tools = append(tools, map[string]any{
+				"type":        "function",
+				"name":        td.Function.Name,
+				"description": td.Function.Description,
+				"parameters":  td.Function.Parameters,
+			})
+		}
+		body["tools"] = tools
+	}
+	// 思考模式（Responses API 用 reasoning.effort）
+	switch req.Thinking {
+	case "deep":
+		body["reasoning"] = map[string]any{"effort": "high"}
+	case "default":
+		body["reasoning"] = map[string]any{"effort": "medium"}
+	}
+	return body, nil
+}
+
+// OpenAIResponsesItem 表示 Responses API 的一个输出项（非流式）。
+type OpenAIResponsesItem struct {
+	Type      string `json:"type"`
+	Role      string `json:"role,omitempty"`
+	ID        string `json:"id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+	Content   []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content,omitempty"`
+}
+
+// ParseOpenAIResponsesResponse 解析 OpenAI Responses API 的非流式响应。
+func ParseOpenAIResponsesResponse(body []byte) (*ChatResponse, error) {
+	var raw struct {
+		Model  string                `json:"model"`
+		Output []OpenAIResponsesItem `json:"output"`
+		Usage  *struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+			TotalTokens  int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("解析 OpenAI Responses 响应失败: %w", err)
+	}
+	result := &ChatResponse{Model: raw.Model}
+	if raw.Usage != nil {
+		result.Usage = &Usage{
+			PromptTokens:     raw.Usage.InputTokens,
+			CompletionTokens: raw.Usage.OutputTokens,
+			TotalTokens:      raw.Usage.TotalTokens,
+		}
+	}
+	for _, out := range raw.Output {
+		for _, c := range out.Content {
+			if c.Type == "output_text" {
+				result.Content += c.Text
+			}
+		}
+	}
 	return result, nil
 }

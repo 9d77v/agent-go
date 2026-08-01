@@ -2,6 +2,7 @@ package credential
 
 import (
 	"log"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -15,6 +16,8 @@ type credentialType uint32
 const (
 	credTypeGeneric credentialType = 1
 )
+
+const credEnumAllCredentials uint32 = 1
 
 type credPersist uint32
 
@@ -41,10 +44,11 @@ type CREDENTIALW struct {
 var (
 	modadvapi32 = windows.NewLazySystemDLL("advapi32.dll")
 
-	procCredWriteW  = modadvapi32.NewProc("CredWriteW")
-	procCredReadW   = modadvapi32.NewProc("CredReadW")
-	procCredFree    = modadvapi32.NewProc("CredFree")
-	procCredDeleteW = modadvapi32.NewProc("CredDeleteW")
+	procCredWriteW     = modadvapi32.NewProc("CredWriteW")
+	procCredReadW      = modadvapi32.NewProc("CredReadW")
+	procCredFree       = modadvapi32.NewProc("CredFree")
+	procCredDeleteW    = modadvapi32.NewProc("CredDeleteW")
+	procCredEnumerateW = modadvapi32.NewProc("CredEnumerateW")
 )
 
 func winCredWrite(targetName, userName, secret string) error {
@@ -117,6 +121,39 @@ func winCredDelete(targetName string) error {
 		return err
 	}
 	return nil
+}
+
+// winCredEnumerate 枚举目标名以 prefix 开头的所有通用凭据，返回完整目标名列表。
+// Windows 的 Generic 凭据 TargetName 带有 "LegacyGeneric:target=" 包装，此处剥离后再匹配。
+func winCredEnumerate(prefix string) ([]string, error) {
+	var count uint32
+	var pcreds unsafe.Pointer
+	ret, _, err := procCredEnumerateW.Call(
+		0, // filter = NULL，枚举全部
+		uintptr(credEnumAllCredentials),
+		uintptr(unsafe.Pointer(&count)),
+		uintptr(unsafe.Pointer(&pcreds)),
+	)
+	if ret == 0 {
+		return nil, err
+	}
+	defer procCredFree.Call(uintptr(pcreds))
+
+	elems := unsafe.Slice((*unsafe.Pointer)(pcreds), int(count))
+	var result []string
+	for _, e := range elems {
+		cred := (*CREDENTIALW)(e)
+		if cred.TargetName == nil {
+			continue
+		}
+		target := windows.UTF16PtrToString(cred.TargetName)
+		// 剥离 Windows 为 Generic 凭据添加的 "LegacyGeneric:target=" 包装前缀
+		target = strings.TrimPrefix(target, "LegacyGeneric:target=")
+		if strings.HasPrefix(target, prefix) {
+			result = append(result, target)
+		}
+	}
+	return result, nil
 }
 
 // EnsureCredentialAPI 检查 Windows Credential API 是否可用

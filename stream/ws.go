@@ -23,8 +23,7 @@ type MessageHandler func(conn *websocket.Conn, req *WsRequest) bool
 
 // WSServer provides a WebSocket server for agent streaming communication.
 // It handles /ws (main agent stream) and /files/{idx}/{path} (file serving) routes.
-// Application-specific routes (e.g., /ws/terminal/) should be added by wrapping
-// in the application layer.
+// Application-specific routes can be registered via RegisterRoute before Start().
 type WSServer struct {
 	port           int
 	server         *http.Server
@@ -33,6 +32,18 @@ type WSServer struct {
 	clients        map[*websocket.Conn]bool
 	fileServerDirs []string
 	onMessage      MessageHandler // optional: hook for custom message types
+	routes         []routeEntry   // custom routes registered by application layer
+}
+
+type routeEntry struct {
+	pattern string
+	handler http.HandlerFunc
+}
+
+// RegisterRoute adds a custom HTTP route to the server mux.
+// Must be called before Start(). The pattern follows http.ServeMux conventions.
+func (ws *WSServer) RegisterRoute(pattern string, handler http.HandlerFunc) {
+	ws.routes = append(ws.routes, routeEntry{pattern, handler})
 }
 
 // SetOnMessage registers a custom message handler hook.
@@ -111,8 +122,7 @@ func (ws *WSServer) ServeFile(w http.ResponseWriter, r *http.Request) {
 }
 
 // Start starts the WebSocket server on a random localhost port.
-// Application-specific routes can be registered on the mux after calling Start.
-// Use NewServeMux() and register routes before Serve.
+// Custom routes registered via RegisterRoute() are included in the mux.
 func (ws *WSServer) Start() error {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -123,9 +133,17 @@ func (ws *WSServer) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", ws.ServeWS)
 	mux.HandleFunc("/files/", ws.ServeFile)
+	// Custom routes registered by the application layer
+	for _, r := range ws.routes {
+		mux.HandleFunc(r.pattern, r.handler)
+	}
 
 	ws.server = &http.Server{Handler: mux}
-	go ws.server.Serve(listener)
+	go func() {
+		if err := ws.server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			log.Printf("[WS] server error: %v", err)
+		}
+	}()
 	return nil
 }
 
@@ -134,6 +152,17 @@ func (ws *WSServer) Stop() {
 	if ws.server != nil {
 		ws.server.Shutdown(context.Background())
 	}
+}
+
+// WriteJSON sends a StreamMessage to a WebSocket connection.
+// This is a public wrapper around writeJSON for use by application-layer code
+// (e.g., custom message handlers registered via SetOnMessage).
+func (ws *WSServer) WriteJSON(c *websocket.Conn, msg StreamMessage) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	return ws.writeJSON(c, data)
 }
 
 // Broadcast sends a JSON message to all connected clients.
@@ -147,14 +176,15 @@ func (ws *WSServer) Broadcast(data any) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	for c := range ws.clients {
-		ws.writeJSON(c, raw)
+		_ = ws.writeJSON(c, raw)
 	}
 }
 
-func (ws *WSServer) writeJSON(c *websocket.Conn, data []byte) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+// writeJSON sends JSON-encoded bytes to a WebSocket connection.
+func (ws *WSServer) writeJSON(c *websocket.Conn, data []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	c.Write(ctx, websocket.MessageText, data)
+	return c.Write(ctx, websocket.MessageText, data)
 }
 
 // handleWS handles the main WebSocket connection.
@@ -209,6 +239,8 @@ func (ws *WSServer) handleMessage(c *websocket.Conn, req *WsRequest) {
 		ws.sm.ResolveApproval(req.ApprovalID, false)
 	case "questionnaire_answer":
 		ws.sm.ResolveQuestionnaire(req.QuestionnaireID, req.Text)
+	case "continue_response":
+		ws.handleContinue(c, req)
 	case "ping":
 		// keep-alive, no response needed
 	default:
@@ -217,7 +249,23 @@ func (ws *WSServer) handleMessage(c *websocket.Conn, req *WsRequest) {
 }
 
 // handleStart starts a new stream and sends messages to the WebSocket.
+// Supports optional OnClientDisconnect hook for cleanup.
 func (ws *WSServer) handleStart(c *websocket.Conn, req *WsRequest) {
+	ws.startStream(c, req, req.Message)
+}
+
+// handleContinue resumes the agent on the same session.
+// 前端在达到最大迭代次数后点击"继续执行"时调用，复用同一 session 继续编排。
+func (ws *WSServer) handleContinue(c *websocket.Conn, req *WsRequest) {
+	if req.SessionID == "" {
+		ws.writeJSON(c, mustMarshal(StreamMessage{Type: "error", Error: "session_id required for continue"}))
+		return
+	}
+	ws.startStream(c, req, "（自动继续）请从上次中断的地方继续完成你的任务。")
+}
+
+// startStream opens a stream for the given message and forwards messages to the client.
+func (ws *WSServer) startStream(c *websocket.Conn, req *WsRequest, message string) {
 	// 前端未传 sessionID 时由后端生成 UUID v7
 	sessionID := req.SessionID
 	if sessionID == "" {
@@ -225,7 +273,7 @@ func (ws *WSServer) handleStart(c *websocket.Conn, req *WsRequest) {
 	}
 
 	streamID, msgCh, err := ws.sm.StartStream(
-		sessionID, req.Message, req.Model, req.ProviderID,
+		sessionID, message, req.Model, req.ProviderID,
 		req.Mode, req.Thinking, req.ApprovalMode, req.IncludeProjectDocs,
 	)
 	if err != nil {
@@ -237,9 +285,15 @@ func (ws *WSServer) handleStart(c *websocket.Conn, req *WsRequest) {
 	ws.writeJSON(c, mustMarshal(StreamMessage{Type: "started", StreamID: streamID, SessionID: sessionID}))
 
 	for msg := range msgCh {
+		msg.StreamID = streamID
 		data, _ := json.Marshal(msg)
-		ws.writeJSON(c, data)
+		if err := ws.writeJSON(c, data); err != nil {
+			log.Printf("[WS] 客户端断连 (stream=%s): %v，取消会话", streamID, err)
+			ws.sm.CancelStream(streamID)
+			break
+		}
 	}
+	log.Printf("[WS] 流完成 (stream=%s)", streamID)
 }
 
 func mustMarshal(v any) []byte {
