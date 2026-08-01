@@ -32,7 +32,9 @@ func NewStreamManager(orchestrator Orchestrator) *StreamManager {
 // StartStream starts a new streaming session.
 // Returns streamID, message channel, and error.
 func (sm *StreamManager) StartStream(
-	sessionID, message, model, providerID, mode, thinking, approvalMode string,
+	sessionID, message string,
+	images []ImageInput,
+	model, providerID, mode, thinking, approvalMode string,
 	includeProjectDocs ...bool,
 ) (string, <-chan StreamMessage, error) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -156,7 +158,7 @@ func (sm *StreamManager) StartStream(
 			},
 		}
 
-		sm.orchestrator.Orchestrate(ctx, sessionID, message, model, providerID, mode, thinking, am, "", callbacks, includeProjectDocs...)
+		sm.orchestrator.Orchestrate(ctx, sessionID, message, images, model, providerID, mode, thinking, am, "", callbacks, includeProjectDocs...)
 	}()
 
 	return streamID, msgCh, nil

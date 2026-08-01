@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -540,6 +541,88 @@ func (m *ChatModel) SimpleChat(ctx context.Context, systemPrompt, userMessage st
 		messages = append(messages, chatMessage{Role: "system", Content: systemPrompt})
 	}
 	messages = append(messages, chatMessage{Role: "user", Content: userMessage})
+
+	req := map[string]any{
+		"model":    m.name,
+		"messages": messages,
+		"stream":   false,
+	}
+
+	body, _ := json.Marshal(req)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", m.baseURL, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if m.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+m.apiKey)
+	}
+
+	resp, err := m.client.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("chat request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("chat API error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var chatResp chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+
+	if len(chatResp.Choices) > 0 {
+		return chatResp.Choices[0].Message.Content, nil
+	}
+	return "", nil
+}
+
+// SimpleChatWithImage 发送一条带图片的用户消息并返回文本响应（Chat Completions 协议）。
+// 用于 VL 视觉解读：图片以 image_url（data URL）形式与文本一起发送。
+func (m *ChatModel) SimpleChatWithImage(ctx context.Context, systemPrompt, userMessage string, images []ImageInput) (string, error) {
+	type contentPart struct {
+		Type     string `json:"type"`
+		Text     string `json:"text,omitempty"`
+		ImageURL *struct {
+			URL string `json:"url"`
+		} `json:"image_url,omitempty"`
+	}
+	type imgMessage struct {
+		Role    string        `json:"role"`
+		Content []contentPart `json:"content"`
+	}
+
+	var messages []any
+	if systemPrompt != "" {
+		messages = append(messages, chatMessage{Role: "system", Content: systemPrompt})
+	}
+
+	parts := make([]contentPart, 0, len(images)+1)
+	if userMessage != "" {
+		parts = append(parts, contentPart{Type: "text", Text: userMessage})
+	}
+	for _, img := range images {
+		if len(img.Data) == 0 {
+			continue
+		}
+		mime := img.MIME
+		if mime == "" {
+			mime = "image/webp"
+		}
+		parts = append(parts, contentPart{
+			Type: "image_url",
+			ImageURL: &struct {
+				URL string `json:"url"`
+			}{URL: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(img.Data)},
+		})
+	}
+	if len(parts) == 0 {
+		return "", fmt.Errorf("SimpleChatWithImage: no text or image content")
+	}
+	messages = append(messages, imgMessage{Role: "user", Content: parts})
 
 	req := map[string]any{
 		"model":    m.name,

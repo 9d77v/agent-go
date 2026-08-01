@@ -12,11 +12,16 @@ import (
 // OrchestratorCallbacks re-exports the agent package callbacks.
 type OrchestratorCallbacks = fwagent.OrchestratorCallbacks
 
+// ImageInput 随 start 消息提交的图片（webp base64），复用 agent 包类型。
+type ImageInput = fwagent.ImageInput
+
 // Orchestrator is the interface for running an agent orchestration.
 type Orchestrator interface {
 	Orchestrate(
 		ctx context.Context,
-		sessionID, message, model, providerID, mode, thinking string,
+		sessionID, message string,
+		images []ImageInput,
+		model, providerID, mode, thinking string,
 		approvalMode ftool.ApprovalMode,
 		termID string,
 		callbacks *OrchestratorCallbacks,
@@ -64,23 +69,24 @@ type StreamMessage struct {
 
 // WsRequest is a WebSocket client request.
 type WsRequest struct {
-	Type               string `json:"type"`
-	SessionID          string `json:"session_id,omitempty"`
-	StreamID           string `json:"stream_id,omitempty"`
-	Message            string `json:"message,omitempty"`
-	Model              string `json:"model,omitempty"`
-	ProviderID         string `json:"provider_id,omitempty"`
-	Mode               string `json:"mode,omitempty"`
-	Thinking           string `json:"thinking,omitempty"`
-	ApprovalMode       string `json:"approval_mode,omitempty"`
-	IncludeProjectDocs bool   `json:"include_project_docs,omitempty"`
-	ApprovalID         string `json:"approval_id,omitempty"`
-	Approved           bool   `json:"approved,omitempty"`
-	FilePath           string `json:"file_path,omitempty"`
-	BackupPath         string `json:"backup_path,omitempty"`
-	QuestionnaireID    string `json:"questionnaire_id,omitempty"`
-	Text               string `json:"text,omitempty"`
-	MessageID          string `json:"message_id,omitempty"`
+	Type               string       `json:"type"`
+	SessionID          string       `json:"session_id,omitempty"`
+	StreamID           string       `json:"stream_id,omitempty"`
+	Message            string       `json:"message,omitempty"`
+	Images             []ImageInput `json:"images,omitempty"`
+	Model              string       `json:"model,omitempty"`
+	ProviderID         string       `json:"provider_id,omitempty"`
+	Mode               string       `json:"mode,omitempty"`
+	Thinking           string       `json:"thinking,omitempty"`
+	ApprovalMode       string       `json:"approval_mode,omitempty"`
+	IncludeProjectDocs bool         `json:"include_project_docs,omitempty"`
+	ApprovalID         string       `json:"approval_id,omitempty"`
+	Approved           bool         `json:"approved,omitempty"`
+	FilePath           string       `json:"file_path,omitempty"`
+	BackupPath         string       `json:"backup_path,omitempty"`
+	QuestionnaireID    string       `json:"questionnaire_id,omitempty"`
+	Text               string       `json:"text,omitempty"`
+	MessageID          string       `json:"message_id,omitempty"`
 }
 
 // StreamSession manages a single streaming session.

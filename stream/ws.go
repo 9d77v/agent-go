@@ -273,7 +273,7 @@ func (ws *WSServer) startStream(c *websocket.Conn, req *WsRequest, message strin
 	}
 
 	streamID, msgCh, err := ws.sm.StartStream(
-		sessionID, message, req.Model, req.ProviderID,
+		sessionID, message, req.Images, req.Model, req.ProviderID,
 		req.Mode, req.Thinking, req.ApprovalMode, req.IncludeProjectDocs,
 	)
 	if err != nil {
