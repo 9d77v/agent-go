@@ -16,8 +16,9 @@ type ToolResult struct {
 	FileExists bool            `json:"file_exists,omitempty"`
 }
 
-// ToolHandler 单个工具的执行函数类型
-type ToolHandler func(args json.RawMessage) *ToolResult
+// ToolHandler 单个工具的执行函数类型。
+// ctx 携带当前调用上下文（ADK agent.Context，含 SessionID()），供按调用获取会话身份。
+type ToolHandler func(ctx context.Context, args json.RawMessage) *ToolResult
 
 // ---------- 风险级别 ----------
 

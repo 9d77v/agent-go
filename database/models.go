@@ -1,17 +1,65 @@
 package database
 
-import "gorm.io/gorm"
+import (
+	"database/sql/driver"
+	"encoding/json"
+	"fmt"
+
+	"gorm.io/gorm"
+)
 
 // ── Common GORM models persisted in the main database ──
 
 // SessionExtModel stores extended session data (approval_mode, title, token_usage, system_prompt)
 // that ADK session.Service does not natively support.
 type SessionExtModel struct {
-	SessionID    string `gorm:"primaryKey;size:64"`
-	ApprovalMode string `gorm:"size:16;default:default"`
-	Title        string `gorm:"size:256;default:''"`
-	TokenUsage   string `gorm:"type:text;default:'{}'"`
-	SystemPrompt string `gorm:"type:text;default:''"`
+	SessionID    string   `gorm:"primaryKey;size:64"`
+	ApprovalMode string   `gorm:"size:16;default:default"`
+	Title        string   `gorm:"size:256;default:''"`
+	TokenUsage   string   `gorm:"type:text;default:'{}'"`
+	SystemPrompt string   `gorm:"type:text;default:''"`
+	Todos        TodoList `gorm:"type:text;default:'[]'"`
+}
+
+// TodoItem 单个待办项（与 todo 工具 todoList schema 对齐：id/title/status）
+type TodoItem struct {
+	ID     int64  `json:"id"`
+	Title  string `json:"title"`
+	Status string `json:"status"`
+}
+
+// TodoList 会话级待办清单，作为类型化 JSON 列存储。
+// SQLite（glebarez 纯 Go 驱动）无原生 JSON 类型，通过 Value/Scan 以 JSON 文本落库。
+type TodoList []TodoItem
+
+// Value 实现 driver.Valuer，序列化为 JSON 文本。
+func (t TodoList) Value() (driver.Value, error) {
+	if t == nil {
+		t = TodoList{}
+	}
+	return json.Marshal(t)
+}
+
+// Scan 实现 sql.Scanner，从 JSON 文本反序列化。
+func (t *TodoList) Scan(v any) error {
+	if v == nil {
+		*t = TodoList{}
+		return nil
+	}
+	var data []byte
+	switch x := v.(type) {
+	case []byte:
+		data = x
+	case string:
+		data = []byte(x)
+	default:
+		return fmt.Errorf("无法解析 TodoList: %T", v)
+	}
+	if len(data) == 0 {
+		*t = TodoList{}
+		return nil
+	}
+	return json.Unmarshal(data, t)
 }
 
 func (SessionExtModel) TableName() string { return "session_ext" }

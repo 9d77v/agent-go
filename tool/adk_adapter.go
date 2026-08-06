@@ -20,7 +20,7 @@ type AdkToolConfig struct {
 }
 
 // NewAdkTool creates an ADK-compatible tool from a handler and config.
-func NewAdkTool(cfg AdkToolConfig, handler func(name string, args json.RawMessage) *ToolResult) adktool.Tool {
+func NewAdkTool(cfg AdkToolConfig, handler ToolHandler) adktool.Tool {
 	schema := &genai.Schema{Type: genai.TypeObject}
 	if props, ok := cfg.Parameters["properties"]; ok {
 		if m, ok := props.(map[string]any); ok {
@@ -47,7 +47,7 @@ type adkTool struct {
 	name        string
 	description string
 	params      *genai.Schema
-	handler     func(name string, args json.RawMessage) *ToolResult
+	handler     ToolHandler
 }
 
 func (t *adkTool) Name() string        { return t.name }
@@ -64,7 +64,8 @@ func (t *adkTool) Declaration() *genai.FunctionDeclaration {
 
 func (t *adkTool) Run(ctx agent.Context, args any) (map[string]any, error) {
 	raw, _ := json.Marshal(args)
-	result := t.handler(t.name, raw)
+	// 透传 ctx：ADK agent.Context 携带 SessionID()，供工具按调用获取会话身份（支持并行子 Agent）
+	result := t.handler(ctx, raw)
 	if !result.Success {
 		return nil, fmt.Errorf("%s", result.Error)
 	}

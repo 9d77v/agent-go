@@ -144,20 +144,21 @@ func DefaultToolDefinitions() []ToolDefinition {
 		},
 		{
 			Name:        "todo",
-			Description: "Manage a structured todo list. Supports create, update, delete, and list operations.",
+			Description: "Manage a structured todo list for the current session. Pass the ENTIRE list of todo items each call — the tool replaces the whole list (full-list replacement). The id field is optional and server-assigned: omit it when creating items; the server auto-increments integer ids and echoes them in the tool result so later calls can reference them to update statuses in place. Only title is required (status defaults to not-started). Use for multi-step tasks; a new task starts with a fresh list.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"todoList": map[string]any{
 						"type":        "array",
-						"description": "Array of todo items. Each item has id, title, and status fields.",
+						"description": "Array of todo items. Each item has title (required) and optional status; id is server-generated — integers or numeric strings are accepted, anything else is ignored and a new id is assigned.",
 						"items": map[string]any{
 							"type": "object",
 							"properties": map[string]any{
-								"id":     map[string]any{"type": "integer"},
-								"title":  map[string]any{"type": "string"},
-								"status": map[string]any{"type": "string", "enum": []any{"not-started", "in-progress", "completed"}},
+								"id":     map[string]any{"type": "integer", "description": "Server-assigned auto-increment id (integer). Optional — omit when creating items; include to update the status of an existing item. Non-integer values are ignored and a new id is assigned."},
+								"title":  map[string]any{"type": "string", "description": "Todo item title (required)."},
+								"status": map[string]any{"type": "string", "enum": []any{"not-started", "in-progress", "completed"}, "description": "Optional. Defaults to not-started."},
 							},
+							"required": []any{"title"},
 						},
 					},
 				},

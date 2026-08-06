@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -48,7 +49,7 @@ func (e *ToolExecutor) ListTools() []string {
 }
 
 // Execute 统一执行入口
-func (e *ToolExecutor) Execute(toolName string, args json.RawMessage) *ToolResult {
+func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args json.RawMessage) *ToolResult {
 	e.mu.RLock()
 	handler, ok := e.handlers[toolName]
 	e.mu.RUnlock()
@@ -58,5 +59,5 @@ func (e *ToolExecutor) Execute(toolName string, args json.RawMessage) *ToolResul
 			Error:   fmt.Sprintf("未知工具: %s", toolName),
 		}
 	}
-	return handler(args)
+	return handler(ctx, args)
 }

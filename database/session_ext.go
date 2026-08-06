@@ -38,7 +38,15 @@ func (s *SessionExtStore) GetSessionExtBatch(sessionIDs []string) map[string]*Se
 }
 
 // SaveSessionExt persists the session extension record (create or update).
+// Todos 列由 todo 工具通过 SaveTodos 独立管理：调用方传入的记录可能是早于 SaveTodos
+// 的过期快照（如 orchestrator 回合开始时的 ext），直接全字段 Save 会把最新待办清单覆盖为空。
+// 因此保存前先合并数据库中已有的 Todos，保证会话待办不被误清。
 func (s *SessionExtStore) SaveSessionExt(m *SessionExtModel) error {
+	var existing SessionExtModel
+	if err := s.db.Where("session_id = ?", m.SessionID).First(&existing).Error; err == nil {
+		// 保留 todo 工具写入的最新待办，避免过期快照整行覆盖
+		m.Todos = existing.Todos
+	}
 	return s.db.Save(m).Error
 }
 
@@ -58,6 +66,22 @@ func (s *SessionExtStore) SetApprovalMode(sessionID, mode string) error {
 	}
 	m := s.GetSessionExt(sessionID)
 	m.ApprovalMode = mode
+	return s.db.Save(m).Error
+}
+
+// GetTodos 返回会话的待办清单（无记录或为 nil 时返回空列表）。
+func (s *SessionExtStore) GetTodos(sessionID string) (TodoList, error) {
+	m := s.GetSessionExt(sessionID)
+	if m.Todos == nil {
+		return TodoList{}, nil
+	}
+	return m.Todos, nil
+}
+
+// SaveTodos 持久化会话的待办清单（全量替换语义）。
+func (s *SessionExtStore) SaveTodos(sessionID string, todos TodoList) error {
+	m := s.GetSessionExt(sessionID)
+	m.Todos = todos
 	return s.db.Save(m).Error
 }
 
