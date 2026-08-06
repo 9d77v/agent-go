@@ -236,9 +236,10 @@ func (ws *WSServer) handleMessage(c *websocket.Conn, req *WsRequest) {
 	case "cancel":
 		ws.sm.CancelStream(req.StreamID)
 	case "approve_tool":
-		ws.sm.ResolveApproval(req.ApprovalID, true)
+		// ADK 原生 HITL 审批恢复：批准 → 以 FunctionResponse 恢复被暂停的工具
+		ws.startResumeStream(c, req, true)
 	case "reject_tool":
-		ws.sm.ResolveApproval(req.ApprovalID, false)
+		ws.startResumeStream(c, req, false)
 	case "questionnaire_answer":
 		ws.sm.ResolveQuestionnaire(req.QuestionnaireID, req.Text)
 	case "continue_response":
@@ -296,6 +297,34 @@ func (ws *WSServer) startStream(c *websocket.Conn, req *WsRequest, message strin
 		}
 	}
 	log.Printf("[WS] 流完成 (stream=%s)", streamID)
+}
+
+// startResumeStream 审批恢复流：以 FunctionResponse（adk_request_confirmation）恢复被暂停的工具。
+// 前端 approve_tool/reject_tool 消息携带 session_id 与 approval_id（= 确认 FC 的 ID）。
+func (ws *WSServer) startResumeStream(c *websocket.Conn, req *WsRequest, approved bool) {
+	if req.SessionID == "" || req.ApprovalID == "" {
+		ws.writeJSON(c, mustMarshal(StreamMessage{Type: "error", Error: "session_id and approval_id required for approval resume"}))
+		return
+	}
+
+	streamID, msgCh, err := ws.sm.StartResumeStream(req.SessionID, req.ApprovalID, approved)
+	if err != nil {
+		ws.writeJSON(c, mustMarshal(StreamMessage{Type: "error", Error: err.Error()}))
+		return
+	}
+
+	// Send started event with sessionID（前端据此识别新一轮流）
+	ws.writeJSON(c, mustMarshal(StreamMessage{Type: "started", StreamID: streamID, SessionID: req.SessionID}))
+
+	for msg := range msgCh {
+		msg.StreamID = streamID
+		data, _ := json.Marshal(msg)
+		if err := ws.writeJSON(c, data); err != nil {
+			ws.sm.CancelStream(streamID)
+			break
+		}
+	}
+	log.Printf("[WS] 审批恢复流完成 (stream=%s)", streamID)
 }
 
 func mustMarshal(v any) []byte {

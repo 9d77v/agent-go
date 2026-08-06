@@ -26,6 +26,7 @@ import (
 	"google.golang.org/adk/v2/artifact"
 	"google.golang.org/adk/v2/session"
 	sessdb "google.golang.org/adk/v2/session/database"
+	adktoolconfirmation "google.golang.org/adk/v2/tool/toolconfirmation"
 	"google.golang.org/genai"
 	"gorm.io/gorm"
 )
@@ -239,6 +240,13 @@ func (s *DBService) RepairDanglingSession(sessionID string) (int, error) {
 				continue
 			}
 			if part.FunctionCall != nil && part.FunctionCall.ID != "" {
+				// 确认事件（adk_request_confirmation）等待用户恢复，不是悬空调用。
+				// 若计入 pending，审批恢复前的 RepairDanglingSession 会把它误删，
+				// 导致 RequestConfirmationRequestProcessor 找不到确认事件、工具无法重放
+				//（模型只看到占位结果 "requires confirmation"，误以为审批还在等待）。
+				if part.FunctionCall.Name == adktoolconfirmation.FunctionCallName {
+					continue
+				}
 				pending[part.FunctionCall.ID] = true
 			}
 			if part.FunctionResponse != nil && part.FunctionResponse.ID != "" {

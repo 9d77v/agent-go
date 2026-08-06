@@ -14,6 +14,16 @@ type ToolResult struct {
 	Diff       string          `json:"diff,omitempty"`
 	BackupPath string          `json:"backup_path,omitempty"`
 	FileExists bool            `json:"file_exists,omitempty"`
+
+	// ── ADK 原生 HITL 标记（不序列化）──
+	// ConfirmationRequired：工具已通过 ctx.RequestConfirmation 发起确认，adapter 映射为 ErrConfirmationRequired。
+	ConfirmationRequired bool `json:"-"`
+	// ConfirmationRejected：恢复轮用户拒绝，adapter 映射为 ErrConfirmationRejected。
+	ConfirmationRejected bool `json:"-"`
+	// ConfirmationHint：确认提示文本（透传给前端审批卡片）。
+	ConfirmationHint string `json:"-"`
+	// ConfirmationPayload：确认载荷（含 risk/reason 等，透传给前端）。
+	ConfirmationPayload any `json:"-"`
 }
 
 // ToolHandler 单个工具的执行函数类型。

@@ -22,13 +22,18 @@ type Orchestrator interface {
 		sessionID, message string,
 		images []ImageInput,
 		model, providerID, mode, thinking string,
-		approvalMode ftool.ApprovalMode,
+		approvalMode string,
 		termID string,
 		callbacks *OrchestratorCallbacks,
 		includeProjectDocs ...bool,
 	)
-	ResolveApproval(approvalID string, approved bool)
-	ResumeAfterApproval(approvalID string, approved bool)
+	// ResumeOrchestrate 审批恢复编排：ADK 原生 HITL 恢复轮，以 FunctionResponse 恢复被暂停的工具。
+	ResumeOrchestrate(
+		ctx context.Context,
+		sessionID, approvalID string,
+		approved bool,
+		callbacks *OrchestratorCallbacks,
+	)
 }
 
 // StreamMessage is a WebSocket message sent from backend to frontend.

@@ -4,7 +4,9 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"google.golang.org/adk/v2/artifact"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
+	adktoolconfirmation "google.golang.org/adk/v2/tool/toolconfirmation"
 	"google.golang.org/genai"
 
 	ftool "github.com/9d77v/agent-go/tool"
@@ -73,14 +76,37 @@ func NewAdkRunner(cfg AdkRunnerConfig) (*AdkRunner, error) {
 	}, nil
 }
 
-// Run 运行 Agent 对话，将 ADK Event 流转换为 OrchestratorCallbacks 回调。
+// Run 运行 Agent 对话（文本输入），将 ADK Event 流转换为 OrchestratorCallbacks 回调。
 func (r *AdkRunner) Run(
 	ctx context.Context,
 	userID, sessionID, message string,
 	callbacks *OrchestratorCallbacks,
 ) error {
-	content := genai.NewContentFromText(message, "user")
+	return r.runContent(ctx, userID, sessionID, genai.NewContentFromText(message, "user"), callbacks)
+}
 
+// RunWithContent 运行 Agent，支持任意输入 Content。
+// 用于 ADK 原生 HITL 审批恢复：客户端批准/拒绝后，以 FunctionResponse（adk_request_confirmation）
+// 作为输入再次 Run 同一 session，ADK 的 RequestConfirmationRequestProcessor 会重放原始工具调用。
+func (r *AdkRunner) RunWithContent(
+	ctx context.Context,
+	userID, sessionID string,
+	content *genai.Content,
+	callbacks *OrchestratorCallbacks,
+) error {
+	if content == nil {
+		return fmt.Errorf("content is required")
+	}
+	return r.runContent(ctx, userID, sessionID, content, callbacks)
+}
+
+// runContent 运行 Agent，将 ADK Event 流转换为 OrchestratorCallbacks 回调。
+func (r *AdkRunner) runContent(
+	ctx context.Context,
+	userID, sessionID string,
+	content *genai.Content,
+	callbacks *OrchestratorCallbacks,
+) error {
 	// 生成消息 ID 和回合 ID
 	msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
 	turnID := fmt.Sprintf("turn_%d", time.Now().UnixNano())
@@ -120,13 +146,14 @@ func (r *AdkRunner) Run(
 			continue
 		}
 
-		// 判断该事件是否为"模型响应"（含思考/文本/函数调用）；工具结果事件不含这些
+		// 判断该事件是否为"模型响应"（含思考/文本/函数调用）；工具结果事件不含这些。
+		// adk_request_confirmation 确认事件不视为模型响应（不拆新消息，避免空气泡）。
 		isModelEvent := false
 		for _, part := range event.Content.Parts {
 			if part == nil {
 				continue
 			}
-			if part.Text != "" || part.FunctionCall != nil {
+			if part.Text != "" || (part.FunctionCall != nil && part.FunctionCall.Name != adktoolconfirmation.FunctionCallName) {
 				isModelEvent = true
 				break
 			}
@@ -163,6 +190,47 @@ func (r *AdkRunner) Run(
 
 			// FunctionCall（工具调用）
 			if part.FunctionCall != nil {
+				// ADK 原生 HITL：识别 adk_request_confirmation 事件 → 触发审批请求（approvalID=确认 FC 的 ID）
+				if part.FunctionCall.Name == adktoolconfirmation.FunctionCallName {
+					if callbacks.OnApprovalRequired != nil {
+						approvalID := part.FunctionCall.ID
+						origCallID := approvalID
+						command := ""
+						risk := ftool.RiskDangerous
+						if orig, err := adktoolconfirmation.OriginalCallFrom(part.FunctionCall); err == nil && orig != nil {
+							origCallID = orig.ID
+							// 命令工具只展示实际命令，不暴露内部参数（command/goal/explanation 等）
+							if orig.Name == "run_command" {
+								if cmd, ok := orig.Args["command"].(string); ok {
+									command = cmd
+								}
+							} else if orig.Args != nil {
+								if b, jerr := json.Marshal(orig.Args); jerr == nil {
+									command = fmt.Sprintf("%s %s", orig.Name, string(b))
+								} else {
+									command = fmt.Sprintf("%s %v", orig.Name, orig.Args)
+								}
+							} else {
+								command = orig.Name
+							}
+						}
+						// 从 toolConfirmation 提取 hint 与 payload（含 risk）
+						if tc, ok := part.FunctionCall.Args["toolConfirmation"].(map[string]any); ok {
+							if p, ok := tc["payload"].(map[string]any); ok {
+								if r, ok := p["risk"].(string); ok && r != "" {
+									risk = ftool.RiskLevel(r)
+								}
+							}
+						}
+						log.Printf("[ADK] 识别确认事件 → approval_required approvalID=%s callID=%s risk=%s cmd=%q", approvalID, origCallID, risk, command)
+						callbacks.OnApprovalRequired(approvalID, origCallID, command, risk)
+					} else {
+						log.Printf("[ADK] 识别确认事件但 OnApprovalRequired 未注册（approvalID=%s）", part.FunctionCall.ID)
+					}
+					// 不当作普通工具调用上报
+					continue
+				}
+
 				callID := part.FunctionCall.ID
 				if callID == "" {
 					callID = fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, time.Now().UnixNano())
@@ -177,7 +245,11 @@ func (r *AdkRunner) Run(
 				if callbacks.OnToolCallEnd != nil {
 					argsStr := ""
 					if argsJSON != nil {
-						argsStr = fmt.Sprintf("%v", argsJSON)
+						if b, jerr := json.Marshal(argsJSON); jerr == nil {
+							argsStr = string(b)
+						} else {
+							argsStr = fmt.Sprintf("%v", argsJSON)
+						}
 					}
 					callbacks.OnToolCallEnd(callID, name, argsStr)
 				}
@@ -187,10 +259,24 @@ func (r *AdkRunner) Run(
 			if part.FunctionResponse != nil {
 				callID := part.FunctionResponse.ID
 				name := part.FunctionResponse.Name
+				respStr := fmt.Sprintf("%v", part.FunctionResponse.Response)
+				// 跳过 HITL 占位 FR（确认等待中的占位结果，含 "requires confirmation"），避免误报为真实工具结果
+				if strings.Contains(respStr, "requires confirmation") {
+					continue
+				}
 				result := &ftool.ToolResult{
 					Success: true,
-					Output:  fmt.Sprintf("%v", part.FunctionResponse.Response),
+					Output:  respStr,
 				}
+				// 工具返回错误（如审批被拒绝 call is rejected）→ 标记失败，前端据此显示 error 状态
+				if respMap := part.FunctionResponse.Response; respMap != nil {
+					if errStr, ok := respMap["error"].(string); ok && errStr != "" {
+						result.Success = false
+						result.Error = errStr
+						result.Output = errStr
+					}
+				}
+				log.Printf("[ADK] tool_result callID=%s name=%s success=%v output=%q", callID, name, result.Success, result.Output)
 
 				if callbacks.OnToolExecuting != nil {
 					callbacks.OnToolExecuting(callID, name)

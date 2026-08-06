@@ -64,8 +64,15 @@ func (t *adkTool) Declaration() *genai.FunctionDeclaration {
 
 func (t *adkTool) Run(ctx agent.Context, args any) (map[string]any, error) {
 	raw, _ := json.Marshal(args)
-	// 透传 ctx：ADK agent.Context 携带 SessionID()，供工具按调用获取会话身份（支持并行子 Agent）
+	// 透传 ctx：ADK agent.Context 携带 SessionID()/RequestConfirmation/ToolConfirmation（原生 HITL 原语）
 	result := t.handler(ctx, raw)
+	if result.ConfirmationRequired {
+		// 工具内已调 ctx.RequestConfirmation → 返回 ErrConfirmationRequired，ADK 暂停本轮并生成确认事件
+		return nil, adktool.ErrConfirmationRequired
+	}
+	if result.ConfirmationRejected {
+		return nil, adktool.ErrConfirmationRejected
+	}
 	if !result.Success {
 		return nil, fmt.Errorf("%s", result.Error)
 	}
