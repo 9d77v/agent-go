@@ -102,7 +102,8 @@ func (s *Service) GetFFmpegVersion() string {
 }
 
 // ExecuteFFmpeg 执行 ffmpeg 命令
-// command 是不包含 "ffmpeg" 前缀的参数字符串，例如 "-i input.mp4 output.gif"
+// command 是不包含 "ffmpeg" 前缀的参数字符串，例如 `-y -i "input path" -c:v libwebp "out.webp"`。
+// 直接以独立参数启动 ffmpeg，而非经由 cmd /c / sh -c，避免 shell 对含空格/非 ASCII 路径的引号解析问题。
 func (s *Service) ExecuteFFmpeg(command string) (string, error) {
 	ffmpegPath := s.cfg.GetFFmpegPath()
 	if ffmpegPath == "" {
@@ -111,19 +112,13 @@ func (s *Service) ExecuteFFmpeg(command string) (string, error) {
 
 	log.Printf("[FFmpeg] 执行: %s %s", ffmpegPath, command)
 
-	var (
-		cmd    *exec.Cmd
-		stdout bytes.Buffer
-		stderr bytes.Buffer
-	)
-
+	cmd := exec.Command(ffmpegPath, splitCommandLine(command)...)
 	if runtime.GOOS == "windows" {
-		cmd = exec.Command("cmd", "/c", ffmpegPath+" "+command)
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	} else {
-		cmd = exec.Command("sh", "-c", ffmpegPath+" "+command)
 	}
 
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
@@ -140,6 +135,37 @@ func (s *Service) ExecuteFFmpeg(command string) (string, error) {
 		return output, fmt.Errorf("ffmpeg 执行失败: %w\n%s", err, stderr.String())
 	}
 	return output, nil
+}
+
+// splitCommandLine 将命令参数字符串按空白拆分为参数列表，尊重双引号包裹（引号内空白保留、引号本身剥除）。
+// 用于绕过 Windows cmd /c 的引号解析缺陷，改用 exec.Command 直接传参（由系统负责正确的引号转义）。
+func splitCommandLine(s string) []string {
+	var args []string
+	var cur strings.Builder
+	inQuote := false
+	flush := func() {
+		if cur.Len() > 0 {
+			args = append(args, cur.String())
+			cur.Reset()
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			inQuote = !inQuote
+		case c == ' ' || c == '\t':
+			if inQuote {
+				cur.WriteByte(c)
+			} else {
+				flush()
+			}
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	flush()
+	return args
 }
 
 // GetFFmpegWebsiteURL 返回 ffmpeg 官网下载地址

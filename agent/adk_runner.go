@@ -9,6 +9,7 @@ import (
 	"time"
 
 	adkagent "google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/artifact"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/genai"
@@ -18,7 +19,7 @@ import (
 
 // AdkRunnerConfig 配置 ADK Runner 的参数。
 type AdkRunnerConfig struct {
-	// AppName 应用名称，用于 session/memory 隔离。
+	// AppName 应用名称，用于 session/memory/artifact 隔离。
 	AppName string
 
 	// Agent ADK Agent 实例（由调用方通过 llmagent.New 等创建）。
@@ -26,6 +27,9 @@ type AdkRunnerConfig struct {
 
 	// SessionService 会话持久化服务。
 	SessionService session.Service
+
+	// ArtifactService 制品存储服务（可选）。配置后启用输入 blob（图片等）→ artifact 机制（SaveInputBlobsAsArtifacts）。
+	ArtifactService artifact.Service
 
 	// MemoryService 记忆服务（可选）。
 	MemoryService any
@@ -56,6 +60,7 @@ func NewAdkRunner(cfg AdkRunnerConfig) (*AdkRunner, error) {
 		AppName:           cfg.AppName,
 		Agent:             cfg.Agent,
 		SessionService:    cfg.SessionService,
+		ArtifactService:   cfg.ArtifactService,
 		AutoCreateSession: true,
 	})
 	if err != nil {

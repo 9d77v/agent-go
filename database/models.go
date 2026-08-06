@@ -19,7 +19,7 @@ func (SessionExtModel) TableName() string { return "session_ext" }
 // CommonModels returns all framework-level GORM models.
 // Business layers should append their own models when calling AutoMigrate.
 func CommonModels() []any {
-	return []any{&SessionExtModel{}}
+	return []any{&SessionExtModel{}, &BlobFile{}, &Artifact{}}
 }
 
 // MigrateCommon runs AutoMigrate for framework-level tables.

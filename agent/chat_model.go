@@ -65,11 +65,23 @@ func (m *ChatModel) GenerateContent(ctx context.Context, req *model.LLMRequest, 
 
 type chatMessage struct {
 	Role             string     `json:"role"`
-	Content          string     `json:"content"`
+	Content          any        `json:"content"`
 	ReasoningContent string     `json:"reasoning_content,omitempty"`
 	ToolCalls        []toolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string     `json:"tool_call_id,omitempty"`
 	Name             string     `json:"name,omitempty"`
+}
+
+// chatImageURL OpenAI 多模态 content 的 image_url part 目标地址。
+type chatImageURL struct {
+	URL string `json:"url"`
+}
+
+// chatContentPart OpenAI 多模态 content 数组元素（text / image_url）。
+type chatContentPart struct {
+	Type     string        `json:"type"`
+	Text     string        `json:"text,omitempty"`
+	ImageURL *chatImageURL `json:"image_url,omitempty"`
 }
 
 type toolCall struct {
@@ -124,7 +136,7 @@ type chatStreamChunk struct {
 		Index int `json:"index"`
 		Delta struct {
 			Role             string     `json:"role,omitempty"`
-			Content          string     `json:"content,omitempty"`
+			Content          any        `json:"content,omitempty"`
 			ReasoningContent string     `json:"reasoning_content,omitempty"`
 			ToolCalls        []toolCall `json:"tool_calls,omitempty"`
 		} `json:"delta"`
@@ -251,9 +263,9 @@ func (m *ChatModel) generateStream(ctx context.Context, req *model.LLMRequest) i
 				Partial: true,
 			}
 
-			if delta.Content != "" {
-				fullContent.WriteString(delta.Content)
-				llmResp.Content.Parts = append(llmResp.Content.Parts, &genai.Part{Text: delta.Content})
+			if s, ok := delta.Content.(string); ok && s != "" {
+				fullContent.WriteString(s)
+				llmResp.Content.Parts = append(llmResp.Content.Parts, &genai.Part{Text: s})
 			}
 
 			// 推理/思考内容
@@ -365,7 +377,7 @@ func (m *ChatModel) buildChatRequest(req *model.LLMRequest, stream bool) (*chatR
 		}
 		msg.Content = strings.Join(texts, "\n")
 		// 跳过完全空的消息（ADK 有时会插入空 user Content）
-		hasMainContent := msg.Content != "" || len(msg.ToolCalls) > 0
+		hasMainContent := len(texts) > 0 || len(msg.ToolCalls) > 0
 		if !hasMainContent && len(toolMsgs) == 0 {
 			continue
 		}
@@ -453,8 +465,8 @@ func (m *ChatModel) toLLMResponse(resp *chatResponse) *model.LLMResponse {
 		})
 	}
 
-	if choice.Message.Content != "" {
-		content.Parts = append(content.Parts, &genai.Part{Text: choice.Message.Content})
+	if s, ok := choice.Message.Content.(string); ok && s != "" {
+		content.Parts = append(content.Parts, &genai.Part{Text: s})
 	}
 
 	for _, tc := range choice.Message.ToolCalls {
@@ -575,24 +587,19 @@ func (m *ChatModel) SimpleChat(ctx context.Context, systemPrompt, userMessage st
 	}
 
 	if len(chatResp.Choices) > 0 {
-		return chatResp.Choices[0].Message.Content, nil
+		if s, ok := chatResp.Choices[0].Message.Content.(string); ok {
+			return s, nil
+		}
 	}
 	return "", nil
 }
 
-// SimpleChatWithImage 发送一条带图片的用户消息并返回文本响应（Chat Completions 协议）。
-// 用于 VL 视觉解读：图片以 image_url（data URL）形式与文本一起发送。
-func (m *ChatModel) SimpleChatWithImage(ctx context.Context, systemPrompt, userMessage string, images []ImageInput) (string, error) {
-	type contentPart struct {
-		Type     string `json:"type"`
-		Text     string `json:"text,omitempty"`
-		ImageURL *struct {
-			URL string `json:"url"`
-		} `json:"image_url,omitempty"`
-	}
+// simpleChatWithImageURLValue 发送一条带 image_url 的用户消息并返回文本响应（Chat Completions 协议）。
+// urlValue 为 image_url.url 的值：可为远程 URL 或 base64 data URI（data:<mime>;base64,...）。
+func (m *ChatModel) simpleChatWithImageURLValue(ctx context.Context, systemPrompt, userMessage, urlValue string) (string, error) {
 	type imgMessage struct {
-		Role    string        `json:"role"`
-		Content []contentPart `json:"content"`
+		Role    string            `json:"role"`
+		Content []chatContentPart `json:"content"`
 	}
 
 	var messages []any
@@ -600,28 +607,11 @@ func (m *ChatModel) SimpleChatWithImage(ctx context.Context, systemPrompt, userM
 		messages = append(messages, chatMessage{Role: "system", Content: systemPrompt})
 	}
 
-	parts := make([]contentPart, 0, len(images)+1)
+	parts := make([]chatContentPart, 0, 2)
 	if userMessage != "" {
-		parts = append(parts, contentPart{Type: "text", Text: userMessage})
+		parts = append(parts, chatContentPart{Type: "text", Text: userMessage})
 	}
-	for _, img := range images {
-		if len(img.Data) == 0 {
-			continue
-		}
-		mime := img.MIME
-		if mime == "" {
-			mime = "image/webp"
-		}
-		parts = append(parts, contentPart{
-			Type: "image_url",
-			ImageURL: &struct {
-				URL string `json:"url"`
-			}{URL: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(img.Data)},
-		})
-	}
-	if len(parts) == 0 {
-		return "", fmt.Errorf("SimpleChatWithImage: no text or image content")
-	}
+	parts = append(parts, chatContentPart{Type: "image_url", ImageURL: &chatImageURL{URL: urlValue}})
 	messages = append(messages, imgMessage{Role: "user", Content: parts})
 
 	req := map[string]any{
@@ -657,7 +647,26 @@ func (m *ChatModel) SimpleChatWithImage(ctx context.Context, systemPrompt, userM
 	}
 
 	if len(chatResp.Choices) > 0 {
-		return chatResp.Choices[0].Message.Content, nil
+		if s, ok := chatResp.Choices[0].Message.Content.(string); ok {
+			return s, nil
+		}
 	}
 	return "", nil
+}
+
+// SimpleChatWithImageURL 发送一条带远程图片 URL 的用户消息并返回文本响应（Chat Completions 协议）。
+// 用于 VL 视觉解读：图片以 image_url（远程 URL）形式与文本一起发送，避免传递大字节。
+func (m *ChatModel) SimpleChatWithImageURL(ctx context.Context, systemPrompt, userMessage, imageURL string) (string, error) {
+	return m.simpleChatWithImageURLValue(ctx, systemPrompt, userMessage, imageURL)
+}
+
+// SimpleChatWithImageData 发送一条以 base64 data URI 内联图片的用户消息并返回文本响应。
+// 用于仅支持 base64 图片的本地服务（如 LM Studio）：url 拼为 data:<mime>;base64,<b64>。
+// mime 为空时默认 image/webp。
+func (m *ChatModel) SimpleChatWithImageData(ctx context.Context, systemPrompt, userMessage string, data []byte, mime string) (string, error) {
+	if mime == "" {
+		mime = "image/webp"
+	}
+	dataURI := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)
+	return m.simpleChatWithImageURLValue(ctx, systemPrompt, userMessage, dataURI)
 }

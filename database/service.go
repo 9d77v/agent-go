@@ -14,13 +14,16 @@ package database
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/glebarez/sqlite"
+	"google.golang.org/adk/v2/artifact"
 	"google.golang.org/adk/v2/session"
 	sessdb "google.golang.org/adk/v2/session/database"
 	"google.golang.org/genai"
@@ -30,10 +33,11 @@ import (
 // DBService provides ADK session.Service lazy initialization and
 // a shared GORM database for common tables and business-layer extensions.
 type DBService struct {
-	dbPath     string
-	db         *gorm.DB
-	adkSvc     session.Service // lazy-init via GetSessionService()
-	SessionExt *SessionExtStore
+	dbPath      string
+	db          *gorm.DB
+	adkSvc      session.Service  // lazy-init via GetSessionService()
+	artifactSvc artifact.Service // NewDBService 启动时初始化
+	SessionExt  *SessionExtStore
 }
 
 // NewDBService creates a new DBService.
@@ -57,9 +61,10 @@ func NewDBService(appDataDir, dbFileName string) *DBService {
 	}
 
 	svc := &DBService{
-		dbPath:     dbPath,
-		db:         db,
-		SessionExt: NewSessionExtStore(db),
+		dbPath:      dbPath,
+		db:          db,
+		SessionExt:  NewSessionExtStore(db),
+		artifactSvc: newSQLiteArtifactService(db),
 	}
 
 	// 预初始化 ADK session 数据库（创建 adk_sessions.db 并建表 + WAL checkpoint）
@@ -98,6 +103,56 @@ func (s *DBService) GetSessionService() (session.Service, error) {
 	}
 	s.adkSvc = svc
 	return s.adkSvc, nil
+}
+
+// GetArtifactService returns the SQLite-backed artifact.Service.
+// 制品服务在 NewDBService 启动时统一初始化（blob_files / artifacts 表随 CommonModels 迁移），此处仅为访问器。
+func (s *DBService) GetArtifactService() artifact.Service {
+	return s.artifactSvc
+}
+
+// FindBlobBySHA256 按内容 sha256 查找文件实体（去重）。
+func (s *DBService) FindBlobBySHA256(sha256 string) (*BlobFile, bool, error) {
+	if s.db == nil || sha256 == "" {
+		return nil, false, nil
+	}
+	var b BlobFile
+	err := s.db.Where("sha256 = ?", sha256).First(&b).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return &b, true, nil
+}
+
+// UpsertBlobFile 插入或更新文件实体（sha256 唯一，幂等）。
+func (s *DBService) UpsertBlobFile(sha256, remoteURL, mimeType string, size int64) error {
+	if s.db == nil || sha256 == "" {
+		return nil
+	}
+	var b BlobFile
+	err := s.db.Where("sha256 = ?", sha256).First(&b).Error
+	if err == nil {
+		b.RemoteURL = remoteURL
+		b.MimeType = mimeType
+		b.Size = size
+		return s.db.Save(&b).Error
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return s.db.Create(&BlobFile{ID: newUUID(), SHA256: sha256, RemoteURL: remoteURL, MimeType: mimeType, Size: size}).Error
+	}
+	return err
+}
+
+// FindArtifactByBlobSHA256 按文件 sha256 查找会话内已有 artifact（去重复用文件名）。
+func (s *DBService) FindArtifactByBlobSHA256(appName, userID, sessionID, blobSHA string) (string, bool, error) {
+	svc := s.GetArtifactService()
+	if sa, ok := svc.(*sqliteArtifactService); ok {
+		return sa.FindArtifactByBlobSHA256(appName, userID, sessionID, blobSHA)
+	}
+	return "", false, nil
 }
 
 // adkDB returns a read-only GORM connection to adk_sessions.db.
@@ -251,6 +306,7 @@ func (s *DBService) ListADKSessions(appName string) ([]Session, error) {
 	for i, r := range rows {
 		title := r.ID // fallback
 		if firstMsg, ok := firstMessages[r.ID]; ok && firstMsg != "" {
+			firstMsg = maskArtifactPlaceholders(firstMsg)
 			if len([]rune(firstMsg)) > 50 {
 				title = string([]rune(firstMsg)[:50]) + "..."
 			} else {
@@ -265,6 +321,14 @@ func (s *DBService) ListADKSessions(appName string) ([]Session, error) {
 		}
 	}
 	return result, nil
+}
+
+// artifactPlaceholderRE 匹配 ADK 对输入 blob（图片等）生成的制品占位符。
+var artifactPlaceholderRE = regexp.MustCompile(`Uploaded file: artifact_[^\s]+\. It has been saved to the artifacts`)
+
+// maskArtifactPlaceholders 将制品占位符替换为图片标记，用于会话标题/消息展示。
+func maskArtifactPlaceholders(s string) string {
+	return artifactPlaceholderRE.ReplaceAllString(s, "🖼 [图片]")
 }
 
 // getFirstUserMessages queries the first user message content for each session.

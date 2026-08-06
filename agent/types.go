@@ -11,11 +11,9 @@ const (
 	AgentErrToolFail    AgentErrorType = "tool_fail"
 )
 
-// ImageInput 随请求提交的图片（已转换为 webp 的 base64 数据）。
-// Data 字段为 base64 编码的图片字节，Go JSON 反序列化时自动解码为 []byte。
+// ImageInput 随请求提交的图片（前端已转 webp 并上传 OSS，仅传 URL）。
 type ImageInput struct {
-	MIME string `json:"mime,omitempty"`
-	Data []byte `json:"data,omitempty"`
+	URL string `json:"url,omitempty"`
 }
 
 // QuestionnaireAnswer 用户对问卷的回答

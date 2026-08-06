@@ -196,6 +196,8 @@ func (ws *WSServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[WS] accept error: %v", err)
 		return
 	}
+	// 允许大消息：默认 32KB 读限制会导致带图等大请求读取失败、连接断开
+	c.SetReadLimit(-1)
 	defer c.Close(websocket.StatusNormalClosure, "")
 
 	ws.mu.Lock()

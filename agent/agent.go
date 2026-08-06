@@ -11,6 +11,7 @@ import (
 
 	adkagent "google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
+	"google.golang.org/adk/v2/artifact"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
@@ -29,6 +30,9 @@ type AgentConfig struct {
 
 	// SessionService 会话持久化服务。
 	SessionService session.Service
+
+	// ArtifactService 制品存储服务（可选）。配置后图片等输入 blob 自动存为 artifact，供 load_artifacts 工具加载。
+	ArtifactService artifact.Service
 
 	// MemoryService 记忆服务（可选）。
 	MemoryService any
@@ -140,10 +144,11 @@ func (a *Agent) BuildAndRun(
 
 	// 创建 AdkRunner 并运行
 	runner, err := NewAdkRunner(AdkRunnerConfig{
-		AppName:        a.config.AppName,
-		Agent:          agt,
-		SessionService: a.config.SessionService,
-		MaxIterations:  a.config.MaxIterations,
+		AppName:         a.config.AppName,
+		Agent:           agt,
+		SessionService:  a.config.SessionService,
+		ArtifactService: a.config.ArtifactService,
+		MaxIterations:   a.config.MaxIterations,
 	})
 	if err != nil {
 		return fmt.Errorf("create runner: %w", err)
