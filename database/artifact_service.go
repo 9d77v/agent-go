@@ -2,8 +2,6 @@ package database
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,12 +42,6 @@ type Artifact struct {
 // newUUID 生成 UUID v7 字符串主键。
 func newUUID() string {
 	return uuid.Must(uuid.NewV7()).String()
-}
-
-// contentHash 计算文本内容的 sha256 hex。
-func contentHash(text string) string {
-	sum := sha256.Sum256([]byte(text))
-	return hex.EncodeToString(sum[:])
 }
 
 // ExtractSHA256FromURL 从 OSS 图片 URL 提取内容 sha256（路径最后一段 <64位sha256>.webp）。

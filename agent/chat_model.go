@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"strings"
 
+	ftool "github.com/9d77v/agent-go/tool"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
 )
@@ -158,30 +159,12 @@ func (m *ChatModel) generate(ctx context.Context, req *model.LLMRequest) iter.Se
 			yield(nil, err)
 			return
 		}
-
-		body, _ := json.Marshal(chatReq)
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", m.baseURL, bytes.NewReader(body))
+		resp, err := m.doChatRequest(ctx, chatReq, false)
 		if err != nil {
 			yield(nil, err)
 			return
 		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		if m.apiKey != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+m.apiKey)
-		}
-
-		resp, err := m.client.Do(httpReq)
-		if err != nil {
-			yield(nil, fmt.Errorf("chat request failed: %w", err))
-			return
-		}
 		defer resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			respBody, _ := io.ReadAll(resp.Body)
-			yield(nil, fmt.Errorf("chat API error %d: %s", resp.StatusCode, string(respBody)))
-			return
-		}
 
 		var chatResp chatResponse
 		if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
@@ -191,9 +174,7 @@ func (m *ChatModel) generate(ctx context.Context, req *model.LLMRequest) iter.Se
 
 		llmResp := m.toLLMResponse(&chatResp)
 		if llmResp != nil {
-			if !yield(llmResp, nil) {
-				return
-			}
+			yield(llmResp, nil)
 		}
 	}
 }
@@ -207,31 +188,12 @@ func (m *ChatModel) generateStream(ctx context.Context, req *model.LLMRequest) i
 			yield(nil, err)
 			return
 		}
-
-		body, _ := json.Marshal(chatReq)
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", m.baseURL, bytes.NewReader(body))
+		resp, err := m.doChatRequest(ctx, chatReq, true)
 		if err != nil {
 			yield(nil, err)
 			return
 		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Accept", "text/event-stream")
-		if m.apiKey != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+m.apiKey)
-		}
-
-		resp, err := m.client.Do(httpReq)
-		if err != nil {
-			yield(nil, fmt.Errorf("chat stream failed: %w", err))
-			return
-		}
 		defer resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			respBody, _ := io.ReadAll(resp.Body)
-			yield(nil, fmt.Errorf("chat stream error %d: %s", resp.StatusCode, string(respBody)))
-			return
-		}
 
 		scanner := bufio.NewScanner(resp.Body)
 		var fullContent strings.Builder
@@ -436,7 +398,7 @@ func (m *ChatModel) buildChatRequest(req *model.LLMRequest, stream bool) (*chatR
 					},
 				}
 				if decl.Parameters != nil {
-					td.Function.Parameters = convertSchema(decl.Parameters)
+					td.Function.Parameters = ftool.SchemaToOpenAI(decl.Parameters)
 				}
 				chatReq.Tools = append(chatReq.Tools, td)
 			}
@@ -497,52 +459,59 @@ func (m *ChatModel) toLLMResponse(resp *chatResponse) *model.LLMResponse {
 	return llmResp
 }
 
-// convertSchema converts *genai.Schema to a plain map for JSON serialization,
-// with lowercase type names expected by OpenAI-compatible APIs.
-func convertSchema(s *genai.Schema) map[string]any {
-	if s == nil {
-		return nil
+// doChatRequest 构造并发送 Chat Completions HTTP 请求，校验状态码为 200。
+// 调用方负责关闭返回的 Body。
+func (m *ChatModel) doChatRequest(ctx context.Context, payload any, acceptStream bool) (*http.Response, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
 	}
-	m := map[string]any{
-		"type": convertType(s.Type),
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", m.baseURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
-	if s.Description != "" {
-		m["description"] = s.Description
+	httpReq.Header.Set("Content-Type", "application/json")
+	if acceptStream {
+		httpReq.Header.Set("Accept", "text/event-stream")
 	}
-	if len(s.Required) > 0 {
-		m["required"] = s.Required
+	if m.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+m.apiKey)
 	}
-	if len(s.Enum) > 0 {
-		m["enum"] = s.Enum
+
+	resp, err := m.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("chat request failed: %w", err)
 	}
-	if len(s.Properties) > 0 {
-		props := make(map[string]any, len(s.Properties))
-		for k, v := range s.Properties {
-			props[k] = convertSchema(v)
+	if resp.StatusCode != 200 {
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("chat API error %d: %s", resp.StatusCode, string(respBody))
+	}
+	return resp, nil
+}
+
+// simpleChatText 发送非流式 Chat Completions 请求并返回首个 choice 的文本。
+func (m *ChatModel) simpleChatText(ctx context.Context, messages any) (string, error) {
+	resp, err := m.doChatRequest(ctx, map[string]any{
+		"model":    m.name,
+		"messages": messages,
+		"stream":   false,
+	}, false)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var chatResp chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+	if len(chatResp.Choices) > 0 {
+		if s, ok := chatResp.Choices[0].Message.Content.(string); ok {
+			return s, nil
 		}
-		m["properties"] = props
 	}
-	if s.Items != nil {
-		m["items"] = convertSchema(s.Items)
-	}
-	return m
-}
-
-var typeMap = map[genai.Type]string{
-	genai.TypeUnspecified: "object",
-	genai.TypeObject:      "object",
-	genai.TypeString:      "string",
-	genai.TypeNumber:      "number",
-	genai.TypeInteger:     "integer",
-	genai.TypeBoolean:     "boolean",
-	genai.TypeArray:       "array",
-}
-
-func convertType(t genai.Type) string {
-	if s, ok := typeMap[t]; ok {
-		return s
-	}
-	return "string"
+	return "", nil
 }
 
 // SimpleChat sends a single user message and returns the text response.
@@ -553,45 +522,7 @@ func (m *ChatModel) SimpleChat(ctx context.Context, systemPrompt, userMessage st
 		messages = append(messages, chatMessage{Role: "system", Content: systemPrompt})
 	}
 	messages = append(messages, chatMessage{Role: "user", Content: userMessage})
-
-	req := map[string]any{
-		"model":    m.name,
-		"messages": messages,
-		"stream":   false,
-	}
-
-	body, _ := json.Marshal(req)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", m.baseURL, bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if m.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+m.apiKey)
-	}
-
-	resp, err := m.client.Do(httpReq)
-	if err != nil {
-		return "", fmt.Errorf("chat request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("chat API error %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var chatResp chatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
-	}
-
-	if len(chatResp.Choices) > 0 {
-		if s, ok := chatResp.Choices[0].Message.Content.(string); ok {
-			return s, nil
-		}
-	}
-	return "", nil
+	return m.simpleChatText(ctx, messages)
 }
 
 // simpleChatWithImageURLValue 发送一条带 image_url 的用户消息并返回文本响应（Chat Completions 协议）。
@@ -614,44 +545,7 @@ func (m *ChatModel) simpleChatWithImageURLValue(ctx context.Context, systemPromp
 	parts = append(parts, chatContentPart{Type: "image_url", ImageURL: &chatImageURL{URL: urlValue}})
 	messages = append(messages, imgMessage{Role: "user", Content: parts})
 
-	req := map[string]any{
-		"model":    m.name,
-		"messages": messages,
-		"stream":   false,
-	}
-
-	body, _ := json.Marshal(req)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", m.baseURL, bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if m.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+m.apiKey)
-	}
-
-	resp, err := m.client.Do(httpReq)
-	if err != nil {
-		return "", fmt.Errorf("chat request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("chat API error %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var chatResp chatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
-	}
-
-	if len(chatResp.Choices) > 0 {
-		if s, ok := chatResp.Choices[0].Message.Content.(string); ok {
-			return s, nil
-		}
-	}
-	return "", nil
+	return m.simpleChatText(ctx, messages)
 }
 
 // SimpleChatWithImageURL 发送一条带远程图片 URL 的用户消息并返回文本响应（Chat Completions 协议）。

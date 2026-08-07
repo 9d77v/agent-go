@@ -66,8 +66,8 @@ type OpenAIChatResponse struct {
 	Usage *Usage `json:"usage,omitempty"`
 }
 
-// BuildOpenAIRequest 构建 OpenAI 兼容的非流式请求体
-func BuildOpenAIRequest(req *ChatRequest) (map[string]any, error) {
+// buildOpenAIMessages 将 ChatRequest 消息转换为 OpenAI 兼容消息数组（含 tool_calls/thinking 字段）。
+func buildOpenAIMessages(req *ChatRequest) []map[string]any {
 	msgs := make([]map[string]any, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		msg := map[string]any{"role": m.Role}
@@ -87,45 +87,36 @@ func BuildOpenAIRequest(req *ChatRequest) (map[string]any, error) {
 		}
 		msgs = append(msgs, msg)
 	}
-	body := map[string]any{
-		"model":       req.Model,
-		"messages":    msgs,
-		"temperature": req.Temperature,
-		"stream":      req.Stream,
-	}
+	return msgs
+}
+
+// applyThinking 根据 req.Thinking 注入 thinking 字段。
+func applyThinking(body map[string]any, req *ChatRequest) {
 	switch req.Thinking {
 	case "deep":
 		body["thinking"] = map[string]any{"type": "enabled", "reasoning_effort": "high"}
 	case "default":
 		body["thinking"] = map[string]any{"type": "enabled"}
 	}
+}
+
+// BuildOpenAIRequest 构建 OpenAI 兼容的非流式请求体
+func BuildOpenAIRequest(req *ChatRequest) (map[string]any, error) {
+	body := map[string]any{
+		"model":       req.Model,
+		"messages":    buildOpenAIMessages(req),
+		"temperature": req.Temperature,
+		"stream":      req.Stream,
+	}
+	applyThinking(body, req)
 	return body, nil
 }
 
 // BuildOpenAIStreamRequest 构建流式请求体
 func BuildOpenAIStreamRequest(req *ChatRequest, tools []OpenAIToolDefinition) (map[string]any, error) {
-	msgs := make([]map[string]any, 0, len(req.Messages))
-	for _, m := range req.Messages {
-		msg := map[string]any{"role": m.Role}
-		if len(m.ToolCalls) > 0 {
-			msg["content"] = nil
-		} else {
-			msg["content"] = m.Content
-		}
-		if m.ReasoningContent != "" {
-			msg["reasoning_content"] = m.ReasoningContent
-		}
-		if m.ToolCallID != "" {
-			msg["tool_call_id"] = m.ToolCallID
-		}
-		if len(m.ToolCalls) > 0 {
-			msg["tool_calls"] = m.ToolCalls
-		}
-		msgs = append(msgs, msg)
-	}
 	body := map[string]any{
 		"model":          req.Model,
-		"messages":       msgs,
+		"messages":       buildOpenAIMessages(req),
 		"temperature":    req.Temperature,
 		"stream":         true,
 		"stream_options": map[string]any{"include_usage": true},
@@ -133,12 +124,7 @@ func BuildOpenAIStreamRequest(req *ChatRequest, tools []OpenAIToolDefinition) (m
 	if len(tools) > 0 {
 		body["tools"] = tools
 	}
-	switch req.Thinking {
-	case "deep":
-		body["thinking"] = map[string]any{"type": "enabled", "reasoning_effort": "high"}
-	case "default":
-		body["thinking"] = map[string]any{"type": "enabled"}
-	}
+	applyThinking(body, req)
 	return body, nil
 }
 

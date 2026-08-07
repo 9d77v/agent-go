@@ -87,6 +87,27 @@ func (t *adkTool) ProcessRequest(ctx agent.Context, req *model.LLMRequest) error
 
 var _ adktool.Tool = (*adkTool)(nil)
 
+// typeFromString 将 OpenAI 风格的 JSON Schema 类型名映射为规范 genai.Type 枚举值。
+// genai 枚举为大写（"STRING"/"INTEGER"...），直接 genai.Type(t) 会产生非法枚举值，
+// 在原生 Gemini 等 API 上会校验失败（chat_model.convertSchema 再映射回小写时也不匹配）。
+var typeFromString = map[string]genai.Type{
+	"string":  genai.TypeString,
+	"number":  genai.TypeNumber,
+	"integer": genai.TypeInteger,
+	"boolean": genai.TypeBoolean,
+	"array":   genai.TypeArray,
+	"object":  genai.TypeObject,
+	"null":    genai.TypeNULL,
+}
+
+// parseType 将小写 JSON Schema 类型名解析为规范 genai.Type；未知类型返回 TypeUnspecified。
+func parseType(t string) genai.Type {
+	if v, ok := typeFromString[t]; ok {
+		return v
+	}
+	return genai.TypeUnspecified
+}
+
 // convertProperties converts map[string]any param definitions to genai.Schema.
 func convertProperties(props map[string]any) map[string]*genai.Schema {
 	result := make(map[string]*genai.Schema, len(props))
@@ -94,7 +115,7 @@ func convertProperties(props map[string]any) map[string]*genai.Schema {
 		if defMap, ok := def.(map[string]any); ok {
 			s := &genai.Schema{}
 			if t, ok := defMap["type"].(string); ok {
-				s.Type = genai.Type(t)
+				s.Type = parseType(t)
 			}
 			if desc, ok := defMap["description"].(string); ok {
 				s.Description = desc
@@ -125,7 +146,7 @@ func convertItems(items any) *genai.Schema {
 	if m, ok := items.(map[string]any); ok {
 		s := &genai.Schema{}
 		if t, ok := m["type"].(string); ok {
-			s.Type = genai.Type(t)
+			s.Type = parseType(t)
 		}
 		if enum, ok := m["enum"]; ok {
 			if arr, ok := enum.([]any); ok {

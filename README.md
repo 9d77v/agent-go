@@ -7,14 +7,14 @@
 ```
 agent-go/
 ├── agent/          # ADK-Go Agent 封装层
-│   ├── wails_agent.go   # WailsAgent — 桌面应用 Agent 外观
+│   ├── agent.go         # Agent 外观（NewAgent/SetModel/SetTools/BuildAndRun）
 │   ├── adk_runner.go    # ADK Runner 封装（Event→回调转换）
 │   ├── chat_model.go    # Chat Completions API 适配器
-│   └── types.go         # OrchestratorCallbacks
+│   ├── responses_model.go # Responses API 适配器
+│   └── types.go         # OrchestratorCallbacks/ImageInput
 ├── config/         # 通用配置管理
 │   ├── manager.go       # ConfigManager（双文件 JSON）
-│   ├── tool_tree.go     # ToolTreeNode 树操作工具
-│   └── llm_config.go    # LLMProviderConfig 类型
+│   └── tool_tree.go     # ToolTreeNode 树操作工具
 ├── credential/     # 凭据管理（Windows Credential Manager）
 ├── database/       # 数据库服务
 │   ├── service.go       # DBService（ADK session.Service 懒加载）
@@ -30,8 +30,6 @@ agent-go/
 │   ├── builtin.go       # 内置 MCP 服务器
 │   ├── init.go          # 初始化
 │   └── ...
-├── memory/         # ADK memory.Service SQLite 实现
-│   └── sqlite_service.go
 ├── skills/         # 技能系统（3级加载 + YAML frontmatter）
 ├── stream/         # WebSocket 流式通信
 │   ├── types.go         # StreamMessage/WsRequest/Orchestrator 接口
@@ -47,9 +45,9 @@ agent-go/
 
 ## 核心概念
 
-### WailsAgent (`agent.WailsAgent`)
+### Agent (`agent.NewAgent`)
 
-桌面应用 Agent 外观，封装 ADK-Go Runner。
+ADK-Go Agent 外观：`NewAgent(AgentConfig)` 创建，`SetModel`/`SetResponsesModel` 设置模型，`SetTools`/`SetInstruction`/`SetThinking` 配置，`BuildAndRun` 运行。审批基于 ADK 原生 HITL。
 
 ### ConfigManager (`config.ConfigManager`)
 

@@ -2,51 +2,9 @@ package agent
 
 import "github.com/9d77v/agent-go/tool"
 
-// AgentErrorType 错误类型
-type AgentErrorType string
-
-const (
-	AgentErrNone        AgentErrorType = ""
-	AgentErrCompileFail AgentErrorType = "compile_fail"
-	AgentErrToolFail    AgentErrorType = "tool_fail"
-)
-
 // ImageInput 随请求提交的图片（前端已转 webp 并上传 OSS，仅传 URL）。
 type ImageInput struct {
 	URL string `json:"url,omitempty"`
-}
-
-// QuestionnaireAnswer 用户对问卷的回答
-type QuestionnaireAnswer struct {
-	Answers []QuestionItem `json:"answers"`
-}
-
-// QuestionItem 单个问题的回答
-type QuestionItem struct {
-	Header string `json:"header"`
-	Answer string `json:"answer"`
-}
-
-// ApprovalResult 审批结果
-type ApprovalResult struct {
-	Approved bool
-	Reason   string
-}
-
-// PendingCall 待执行的工具调用
-type PendingCall struct {
-	Name string
-	Args string
-	ID   string
-}
-
-// AgentErrorState 错误状态
-type AgentErrorState struct {
-	ErrType     AgentErrorType
-	File        string
-	Message     string
-	Retries     int
-	LastAttempt string
 }
 
 // ---------- Orchestrator 回调 ----------
@@ -68,15 +26,4 @@ type OrchestratorCallbacks struct {
 	OnTurnComplete     func(turnID, sessionID string)
 	OnError            func(msgID, code, message string)
 	OnTerminalOutput   func(text string, isStderr bool)
-}
-
-// ---------- 编排器配置 ----------
-
-// OrchestratorConfig 编排器配置
-type OrchestratorConfig struct {
-	IterationsPerBatch int
-	ContextWindow      int
-	OutputReserve      int
-	WorkspaceID        string
-	MaxErrorRetries    int
 }

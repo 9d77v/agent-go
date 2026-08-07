@@ -12,6 +12,9 @@ import (
 	"time"
 )
 
+// defaultLLMTimeout 默认 LLM 请求超时。
+const defaultLLMTimeout = 300 * time.Second
+
 // LLMService 通用 LLM 客户端。
 // 支持 Chat Completions (/chat/completions) 与 OpenAI Responses (/responses) 双协议，
 // 以及 Anthropic / Gemini 供应商。请求封装统一在此层，供框架消费者调用，
@@ -23,7 +26,7 @@ type LLMService struct {
 // NewLLMService 创建 LLMService，可配置超时。
 func NewLLMService(timeout time.Duration) *LLMService {
 	if timeout <= 0 {
-		timeout = 300 * time.Second
+		timeout = defaultLLMTimeout
 	}
 	return &LLMService{
 		httpClient: &http.Client{Timeout: timeout},
@@ -217,68 +220,18 @@ func (s *LLMService) callOpenAIStream(
 	body, _ := json.Marshal(bodyMap)
 	base := s.resolveBaseURL(req, "https://api.openai.com/v1")
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", base+"/chat/completions", bytes.NewReader(body))
+	resp, err := s.doStreamRequest(ctx, base+"/chat/completions", body, req.APIKey)
 	if err != nil {
 		return nil, err
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if req.APIKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+req.APIKey)
-	}
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Cache-Control", "no-cache")
-
-	resp, err := s.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("请求失败: %w", err)
-	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API 返回错误 (%d): %s", resp.StatusCode, string(respBody))
-	}
-
 	result := &ChatResponse{Model: req.Model}
-	type pendingToolCall struct {
-		name    string
-		id      string
-		args    strings.Builder
-		started bool // 是否已发送 tool_call_start
-	}
-	pendingTools := make(map[int]*pendingToolCall)
-	reader := bufio.NewReader(resp.Body)
+	tools := newToolCallAccumulator(onToolCallStart, onToolCallDelta, onToolCallEnd)
 	var fullContent strings.Builder
 	var fullReasoning strings.Builder
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, fmt.Errorf("读取流失败: %w", err)
-		}
-
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			break
-		}
-
+	err = forEachSSELine(ctx, bufio.NewReader(resp.Body), func(data string) bool {
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
@@ -291,76 +244,53 @@ func (s *LLMService) callOpenAIStream(
 			Usage *Usage `json:"usage,omitempty"`
 		}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
+			return true
 		}
-
 		if chunk.Usage != nil {
 			result.Usage = chunk.Usage
 		}
+		if len(chunk.Choices) == 0 {
+			return true
+		}
 
-		if len(chunk.Choices) > 0 {
-			delta := chunk.Choices[0].Delta
-
-			if len(delta.ToolCalls) > 0 {
-				for _, tc := range delta.ToolCalls {
-					pt, exists := pendingTools[tc.Index]
-					if !exists {
-						pt = &pendingToolCall{}
-						pendingTools[tc.Index] = pt
-					}
-					if tc.ID != "" {
-						pt.id = tc.ID
-					}
-					if tc.Function != nil {
-						if tc.Function.Name != "" {
-							pt.name = tc.Function.Name
-							if !pt.started {
-								onToolCallStart(pt.id, pt.name)
-								pt.started = true
-							}
-						}
-						if tc.Function.Arguments != "" {
-							onToolCallDelta(pt.id, tc.Function.Arguments)
-							pt.args.WriteString(tc.Function.Arguments)
-						}
-					}
-				}
-				continue
-			}
-
-			if chunk.Choices[0].FinishReason != nil {
-				if *chunk.Choices[0].FinishReason == "tool_calls" {
-					for _, pt := range pendingTools {
-						if pt.name != "" {
-							onToolCallEnd(pt.id, pt.name, pt.args.String())
-						}
-					}
-					pendingTools = make(map[int]*pendingToolCall)
-					continue
-				}
-				if *chunk.Choices[0].FinishReason == "stop" {
-					break
+		delta := chunk.Choices[0].Delta
+		if len(delta.ToolCalls) > 0 {
+			for _, tc := range delta.ToolCalls {
+				if tc.Function != nil {
+					tools.setMeta(tc.Index, tc.ID, tc.Function.Name)
+					tools.appendArgs(tc.Index, tc.Function.Arguments)
 				}
 			}
+			return true
+		}
 
-			if delta.ReasoningContent != "" {
-				fullReasoning.WriteString(delta.ReasoningContent)
-				onReasoning(delta.ReasoningContent)
-			}
-			if delta.Content != "" {
-				fullContent.WriteString(delta.Content)
-				onContent(delta.Content)
+		if chunk.Choices[0].FinishReason != nil {
+			switch *chunk.Choices[0].FinishReason {
+			case "tool_calls":
+				for idx := range tools.pending {
+					tools.finish(idx)
+				}
+				return true
+			case "stop":
+				return false
 			}
 		}
-	}
 
-	// 报告未处理的 tool_call
-	for _, pt := range pendingTools {
-		if pt.name != "" {
-			onToolCallEnd(pt.id, pt.name, pt.args.String())
+		if delta.ReasoningContent != "" {
+			fullReasoning.WriteString(delta.ReasoningContent)
+			onReasoning(delta.ReasoningContent)
 		}
+		if delta.Content != "" {
+			fullContent.WriteString(delta.Content)
+			onContent(delta.Content)
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
 	}
 
+	tools.flush()
 	result.Content = fullContent.String()
 	result.ReasoningContent = fullReasoning.String()
 	return result, nil
@@ -383,69 +313,19 @@ func (s *LLMService) callOpenAIResponsesStream(
 	body, _ := json.Marshal(bodyMap)
 	base := s.resolveBaseURL(req, "https://api.openai.com/v1")
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", base+"/responses", bytes.NewReader(body))
+	resp, err := s.doStreamRequest(ctx, base+"/responses", body, req.APIKey)
 	if err != nil {
 		return nil, err
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if req.APIKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+req.APIKey)
-	}
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Cache-Control", "no-cache")
-
-	resp, err := s.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("请求失败: %w", err)
-	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API 返回错误 (%d): %s", resp.StatusCode, string(respBody))
-	}
-
 	result := &ChatResponse{Model: req.Model}
-	type pendingToolCall struct {
-		name    string
-		id      string
-		args    strings.Builder
-		started bool
-	}
-	pendingTools := make(map[int]*pendingToolCall)
-	reader := bufio.NewReader(resp.Body)
+	tools := newToolCallAccumulator(onToolCallStart, onToolCallDelta, onToolCallEnd)
 	var fullContent strings.Builder
 	var fullReasoning strings.Builder
 
-	finish := false
-	for !finish {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, fmt.Errorf("读取流失败: %w", err)
-		}
-
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			break
-		}
-
+	var runErr error
+	err = forEachSSELine(ctx, bufio.NewReader(resp.Body), func(data string) bool {
 		var event struct {
 			Type  string `json:"type"`
 			Delta string `json:"delta"`
@@ -469,46 +349,21 @@ func (s *LLMService) callOpenAIResponsesStream(
 			} `json:"error"`
 		}
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
-			continue
+			return true
 		}
 
 		switch event.Type {
 		case "response.output_item.added":
 			if event.Item.Type == "function_call" && event.Index != nil {
-				idx := *event.Index
-				pt, exists := pendingTools[idx]
-				if !exists {
-					pt = &pendingToolCall{}
-					pendingTools[idx] = pt
-				}
-				pt.id = event.Item.ID
-				pt.name = event.Item.Name
-				if pt.name != "" && !pt.started {
-					onToolCallStart(pt.id, pt.name)
-					pt.started = true
-				}
+				tools.setMeta(*event.Index, event.Item.ID, event.Item.Name)
 			}
 		case "response.function_call_arguments.delta":
 			if event.Index != nil {
-				idx := *event.Index
-				pt, exists := pendingTools[idx]
-				if !exists {
-					pt = &pendingToolCall{}
-					pendingTools[idx] = pt
-				}
-				if event.Delta != "" {
-					onToolCallDelta(pt.id, event.Delta)
-					pt.args.WriteString(event.Delta)
-				}
+				tools.appendArgs(*event.Index, event.Delta)
 			}
 		case "response.function_call_arguments.done":
 			if event.Index != nil {
-				idx := *event.Index
-				pt := pendingTools[idx]
-				if pt != nil && pt.name != "" {
-					onToolCallEnd(pt.id, pt.name, pt.args.String())
-					delete(pendingTools, idx)
-				}
+				tools.finish(*event.Index)
 			}
 		case "response.output_text.delta":
 			if event.Delta != "" {
@@ -533,24 +388,168 @@ func (s *LLMService) callOpenAIResponsesStream(
 					}
 				}
 			}
-			finish = true
+			return false
 		case "response.failed":
 			msg := "responses 流式调用失败"
 			if event.Error != nil && event.Error.Message != "" {
 				msg = event.Error.Message
 			}
-			return nil, fmt.Errorf("responses 流式错误: %s", msg)
+			runErr = fmt.Errorf("responses 流式错误: %s", msg)
+			return false
 		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if runErr != nil {
+		return nil, runErr
 	}
 
-	// 报告未处理的 tool_call
-	for _, pt := range pendingTools {
-		if pt.name != "" {
-			onToolCallEnd(pt.id, pt.name, pt.args.String())
-		}
-	}
-
+	tools.flush()
 	result.Content = fullContent.String()
 	result.ReasoningContent = fullReasoning.String()
 	return result, nil
+}
+
+// ── 流式共享基础设施 ──
+
+// doStreamRequest 构造并发送流式 POST 请求（SSE Accept），校验状态码为 200。
+// 调用方负责关闭返回的 Body。
+func (s *LLMService) doStreamRequest(ctx context.Context, url string, body []byte, apiKey string) (*http.Response, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("Cache-Control", "no-cache")
+
+	resp, err := s.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("请求失败: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API 返回错误 (%d): %s", resp.StatusCode, string(respBody))
+	}
+	return resp, nil
+}
+
+// forEachSSELine 逐行读取 SSE 流：跳过空行与非 data: 行，对每条 data 调用 fn。
+// fn 返回 false 或遇到 [DONE]/EOF 时终止。
+func forEachSSELine(ctx context.Context, reader *bufio.Reader, fn func(data string) bool) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("读取流失败: %w", err)
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			return nil
+		}
+		if !fn(data) {
+			return nil
+		}
+	}
+}
+
+// pendingToolCall 累积中的工具调用（按 chunk/event index 聚合增量参数）。
+type pendingToolCall struct {
+	name    string
+	id      string
+	args    strings.Builder
+	started bool // 是否已发送 tool_call_start
+}
+
+// toolCallAccumulator 工具调用增量状态机：跨 SSE 事件聚合 name/args，
+// 首次出现 name 时触发 onStart、参数增量触发 onDelta、完成时触发 onEnd。
+type toolCallAccumulator struct {
+	pending map[int]*pendingToolCall
+	onStart func(callID, name string)
+	onDelta func(callID, argsDelta string)
+	onEnd   func(callID, name, arguments string)
+}
+
+func newToolCallAccumulator(
+	onStart func(callID, name string),
+	onDelta func(callID, argsDelta string),
+	onEnd func(callID, name, arguments string),
+) *toolCallAccumulator {
+	return &toolCallAccumulator{
+		pending: make(map[int]*pendingToolCall),
+		onStart: onStart,
+		onDelta: onDelta,
+		onEnd:   onEnd,
+	}
+}
+
+func (a *toolCallAccumulator) ensure(idx int) *pendingToolCall {
+	pt, exists := a.pending[idx]
+	if !exists {
+		pt = &pendingToolCall{}
+		a.pending[idx] = pt
+	}
+	return pt
+}
+
+// setMeta 记录 id/name；name 首次出现时触发 onStart。
+func (a *toolCallAccumulator) setMeta(idx int, id, name string) {
+	pt := a.ensure(idx)
+	if id != "" {
+		pt.id = id
+	}
+	if name != "" {
+		pt.name = name
+		if !pt.started {
+			a.onStart(pt.id, pt.name)
+			pt.started = true
+		}
+	}
+}
+
+// appendArgs 追加参数增量并触发 onDelta。
+func (a *toolCallAccumulator) appendArgs(idx int, argsDelta string) {
+	if argsDelta == "" {
+		return
+	}
+	pt := a.ensure(idx)
+	a.onDelta(pt.id, argsDelta)
+	pt.args.WriteString(argsDelta)
+}
+
+// finish 完成指定 index 的调用（触发 onEnd 并从 pending 移除）。
+func (a *toolCallAccumulator) finish(idx int) {
+	pt := a.pending[idx]
+	if pt != nil && pt.name != "" {
+		a.onEnd(pt.id, pt.name, pt.args.String())
+		delete(a.pending, idx)
+	}
+}
+
+// flush 报告所有未完成的调用（流结束兜底）。
+func (a *toolCallAccumulator) flush() {
+	for _, pt := range a.pending {
+		if pt.name != "" {
+			a.onEnd(pt.id, pt.name, pt.args.String())
+		}
+	}
 }

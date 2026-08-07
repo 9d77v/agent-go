@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/artifact"
@@ -15,10 +14,6 @@ import (
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/genai"
 )
-
-// DefaultUseChatAPI 控制是否默认使用 Chat Completions API 而非 Responses API。
-// 设为 true 时，SetModel 会自动切换到 ChatModel 适配器。
-var DefaultUseChatAPI = true
 
 // AgentConfig Agent 配置。
 type AgentConfig struct {
@@ -31,43 +26,34 @@ type AgentConfig struct {
 	// ArtifactService 制品存储服务（可选）。配置后图片等输入 blob 自动存为 artifact，供 load_artifacts 工具加载。
 	ArtifactService artifact.Service
 
-	// MemoryService 记忆服务（可选）。
-	MemoryService any
-
 	// MaxIterations 单次编排最大迭代次数。
 	MaxIterations int
-
-	// ApprovalTimeout 保留字段（不再使用，兼容配置）。
-	ApprovalTimeout time.Duration
 }
 
 // Agent 通用 Agent 编排外观。
 // 封装 ADK-Go Runner。审核基于 ADK 原生 HITL（工具层 ctx.RequestConfirmation/ToolConfirmation），
 // 框架层不再注册 BeforeToolCallback 门禁。
+// 可变状态（currentLLM/tools/instruction/thinkingMode）由 mu 保护，
+// buildAndRun 在锁内快照后使用，支持并发编排不同会话。
 type Agent struct {
 	config       AgentConfig
-	adkRunner    *AdkRunner
+	mu           sync.Mutex
 	currentLLM   model.LLM
 	tools        []tool.Tool
 	instruction  string
 	thinkingMode string // 思考模式：off / default / deep
-
-	// 问卷 HITL（askQuestions 工具）：与审批不同，走 channel 等待前端回答
-	pendingQuestionnaires map[string]chan string
-	approvalMu            sync.Mutex
 }
 
 // NewAgent 创建 Agent。
 func NewAgent(cfg AgentConfig) *Agent {
-	return &Agent{
-		config:                cfg,
-		pendingQuestionnaires: make(map[string]chan string),
-	}
+	return &Agent{config: cfg}
 }
 
 // SetModel 设置当前使用的 LLM 模型（使用标准 OpenAI Chat Completions API）。
 // 兼容 DeepSeek、Ollama、vLLM 等所有 /v1/chat/completions 兼容的提供商。
 func (a *Agent) SetModel(_ context.Context, apiKey, baseURL, modelName string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.currentLLM = NewChatModel(modelName, apiKey, baseURL)
 	return nil
 }
@@ -79,22 +65,30 @@ func (a *Agent) SetResponsesModel(ctx context.Context, apiKey, baseURL, modelNam
 	if err != nil {
 		return err
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.currentLLM = rm
 	return nil
 }
 
 // SetTools 设置 Agent 可用的工具列表。
 func (a *Agent) SetTools(tools []tool.Tool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.tools = tools
 }
 
 // SetInstruction 设置 Agent 的 system instruction。
 func (a *Agent) SetInstruction(instruction string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.instruction = instruction
 }
 
 // SetThinking 设置思考模式。会在下一次 BuildAndRun 时生效。
 func (a *Agent) SetThinking(mode string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.thinkingMode = mode
 	if cm, ok := a.currentLLM.(*ChatModel); ok {
 		cm.SetThinkingMode(mode)
@@ -132,7 +126,14 @@ func (a *Agent) buildAndRun(
 	content *genai.Content,
 	callbacks *OrchestratorCallbacks,
 ) error {
-	if a.currentLLM == nil {
+	// 快照读取：构建期间并发 SetXxx 不影响本次运行
+	a.mu.Lock()
+	currentLLM := a.currentLLM
+	tools := append([]tool.Tool(nil), a.tools...)
+	instruction := a.instruction
+	a.mu.Unlock()
+
+	if currentLLM == nil {
 		return fmt.Errorf("model not set, call SetModel first")
 	}
 
@@ -140,9 +141,9 @@ func (a *Agent) buildAndRun(
 	agt, err := llmagent.New(llmagent.Config{
 		Name:        "main",
 		Description: "主 Agent",
-		Model:       a.currentLLM,
-		Instruction: a.instruction,
-		Tools:       a.tools,
+		Model:       currentLLM,
+		Instruction: instruction,
+		Tools:       tools,
 	})
 	if err != nil {
 		return fmt.Errorf("create agent: %w", err)
@@ -160,23 +161,5 @@ func (a *Agent) buildAndRun(
 		return fmt.Errorf("create runner: %w", err)
 	}
 
-	a.adkRunner = runner
 	return runner.runContent(ctx, userID, sessionID, content, callbacks)
-}
-
-// ResolveQuestionnaire 处理问卷结果（askQuestions 工具的 channel 回传）。
-func (a *Agent) ResolveQuestionnaire(questionnaireID string, answer string) {
-	a.approvalMu.Lock()
-	ch, ok := a.pendingQuestionnaires[questionnaireID]
-	if ok {
-		delete(a.pendingQuestionnaires, questionnaireID)
-	}
-	a.approvalMu.Unlock()
-
-	if ok {
-		select {
-		case ch <- answer:
-		default:
-		}
-	}
 }

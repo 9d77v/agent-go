@@ -6,7 +6,6 @@ import (
 	"context"
 
 	fwagent "github.com/9d77v/agent-go/agent"
-	ftool "github.com/9d77v/agent-go/tool"
 )
 
 // OrchestratorCallbacks re-exports the agent package callbacks.
@@ -15,25 +14,40 @@ type OrchestratorCallbacks = fwagent.OrchestratorCallbacks
 // ImageInput 随 start 消息提交的图片（webp base64），复用 agent 包类型。
 type ImageInput = fwagent.ImageInput
 
+// OrchestrateParams 编排参数（替代 9+ 个位置参数）。
+type OrchestrateParams struct {
+	SessionID          string
+	Message            string
+	Images             []ImageInput
+	Model              string
+	ProviderID         string
+	Mode               string
+	Thinking           string
+	ApprovalMode       string
+	TermID             string
+	IncludeProjectDocs bool
+}
+
+// ApprovalDecision 单个审批决策。同批多个审批攒齐后随恢复编排一次提交，
+// ADK 的 RequestConfirmationRequestProcessor 会一次性恢复并并发执行所有被确认的工具。
+type ApprovalDecision struct {
+	ApprovalID string
+	Approved   bool
+}
+
+// ResumeParams 审批恢复编排参数（ADK 原生 HITL：以 FunctionResponse 恢复被暂停的工具）。
+// Approvals 携带同批全部已决审批（等一批都通过后统一恢复，避免逐个恢复导致剩余确认永远挂起）。
+type ResumeParams struct {
+	SessionID string
+	Approvals []ApprovalDecision
+}
+
 // Orchestrator is the interface for running an agent orchestration.
 type Orchestrator interface {
-	Orchestrate(
-		ctx context.Context,
-		sessionID, message string,
-		images []ImageInput,
-		model, providerID, mode, thinking string,
-		approvalMode string,
-		termID string,
-		callbacks *OrchestratorCallbacks,
-		includeProjectDocs ...bool,
-	)
+	// Orchestrate 启动一次编排。
+	Orchestrate(ctx context.Context, params OrchestrateParams, callbacks *OrchestratorCallbacks)
 	// ResumeOrchestrate 审批恢复编排：ADK 原生 HITL 恢复轮，以 FunctionResponse 恢复被暂停的工具。
-	ResumeOrchestrate(
-		ctx context.Context,
-		sessionID, approvalID string,
-		approved bool,
-		callbacks *OrchestratorCallbacks,
-	)
+	ResumeOrchestrate(ctx context.Context, params ResumeParams, callbacks *OrchestratorCallbacks)
 }
 
 // StreamMessage is a WebSocket message sent from backend to frontend.
@@ -96,9 +110,8 @@ type WsRequest struct {
 
 // StreamSession manages a single streaming session.
 type StreamSession struct {
-	ID           string
-	SessionID    string
-	Cancel       context.CancelFunc
-	CreatedAt    int64
-	ApprovalMode ftool.ApprovalMode
+	ID        string
+	SessionID string
+	Cancel    context.CancelFunc
+	CreatedAt int64
 }

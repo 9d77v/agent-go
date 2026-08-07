@@ -15,6 +15,27 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// mcpSessionTimeout 单个 MCP 工具调用的超时。
+const mcpSessionTimeout = 30 * time.Second
+
+// mcpToolPrefix MCP 工具名的统一前缀。
+const mcpToolPrefix = "mcp_"
+
+// panicToError 捕获 panic 并转为 error 写入命名返回值；用于外部边界防御（MCP 会话调用可能 panic）。
+func panicToError(label string, err *error) {
+	if r := recover(); r != nil {
+		*err = fmt.Errorf("%s panic: %v", label, r)
+	}
+}
+
+// panicToErrorString 捕获 panic 并转为错误字符串（用于 ExecuteTool 的命名返回值）。
+func panicToErrorString(label string, ok *bool, errStr *string) {
+	if r := recover(); r != nil {
+		*ok = false
+		*errStr = fmt.Sprintf("%s panic: %v", label, r)
+	}
+}
+
 type Manager struct {
 	mu              sync.RWMutex
 	configs         []MCPServerConfig
@@ -184,11 +205,7 @@ func (m *Manager) Start(ctx context.Context, id string) error {
 }
 
 func (m *Manager) startServer(ctx context.Context, cfg *MCPServerConfig) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("startServer panic: %v", r)
-		}
-	}()
+	defer panicToError("startServer", &err)
 	// 验证配置
 	if cfg.Transport == TransportStdio {
 		if cfg.Command == "" {
@@ -312,11 +329,7 @@ func (m *Manager) GetAllTools() []MCPTool {
 }
 
 func (m *Manager) CallTool(ctx context.Context, serverID string, toolName string, args map[string]any) (result any, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("CallTool panic: %v", r)
-		}
-	}()
+	defer panicToError("CallTool", &err)
 	m.mu.RLock()
 	inst, ok := m.servers[serverID]
 	m.mu.RUnlock()
@@ -330,7 +343,7 @@ func (m *Manager) CallTool(ctx context.Context, serverID string, toolName string
 		cctx = ctx
 		cancel = func() {}
 	} else {
-		cctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		cctx, cancel = context.WithTimeout(ctx, mcpSessionTimeout)
 	}
 	defer cancel()
 	res, err := inst.session.CallTool(cctx, &mcp.CallToolParams{Name: toolName, Arguments: args})
@@ -347,7 +360,7 @@ func (m *Manager) BuildToolDefinitions(toolEnabled func(name string) bool) []map
 	}
 	result := make([]map[string]any, 0, len(tools))
 	for _, t := range tools {
-		fullName := "mcp_" + strings.ToLower(t.ServerID) + "_" + t.Name
+		fullName := mcpToolPrefix + strings.ToLower(t.ServerID) + "_" + t.Name
 		if toolEnabled != nil && !toolEnabled(fullName) {
 			continue
 		}
@@ -360,16 +373,12 @@ func (m *Manager) BuildToolDefinitions(toolEnabled func(name string) bool) []map
 }
 
 func (m *Manager) ExecuteTool(toolName string, args json.RawMessage) (ok bool, out string, errStr string) {
-	defer func() {
-		if r := recover(); r != nil {
-			ok = false
-			errStr = fmt.Sprintf("MCP ExecuteTool panic: %v", r)
-		}
-	}()
-	if !strings.HasPrefix(toolName, "mcp_") {
+	defer panicToErrorString("ExecuteTool", &ok, &errStr)
+	if !strings.HasPrefix(toolName, mcpToolPrefix) {
 		return false, "", ""
 	}
-	rest := toolName[4:]
+	// ExecuteTool 中 `rest := toolName[4:]` 使用魔法偏移，改为前缀常量长度
+	rest := toolName[len(mcpToolPrefix):]
 	m.mu.RLock()
 	configs := make([]MCPServerConfig, len(m.configs))
 	copy(configs, m.configs)
@@ -390,7 +399,7 @@ func (m *Manager) ExecuteTool(toolName string, args json.RawMessage) (ok bool, o
 	if err := json.Unmarshal(args, &params); err != nil {
 		return false, "", fmt.Sprintf("参数解析失败: %v", err)
 	}
-	cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cctx, cancel := context.WithTimeout(context.Background(), mcpSessionTimeout)
 	defer cancel()
 	result, err := m.CallTool(cctx, serverID, rawToolName, params)
 	if err != nil {

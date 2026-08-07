@@ -17,6 +17,12 @@ import (
 	"github.com/google/uuid"
 )
 
+// WSServer 路由常量。
+const (
+	wsRoute         = "/ws"
+	fileServePrefix = "/files/"
+)
+
 // MessageHandler is a function that handles a custom WebSocket message.
 // Returns true if the message was handled (prevents default dispatch).
 type MessageHandler func(conn *websocket.Conn, req *WsRequest) bool
@@ -30,6 +36,7 @@ type WSServer struct {
 	sm             *StreamManager
 	mu             sync.Mutex
 	clients        map[*websocket.Conn]bool
+	connLocks      map[*websocket.Conn]*sync.Mutex // 每连接写锁：coder/websocket 连接不支持并发写
 	fileServerDirs []string
 	onMessage      MessageHandler // optional: hook for custom message types
 	routes         []routeEntry   // custom routes registered by application layer
@@ -57,6 +64,7 @@ func NewWSServer(sm *StreamManager, fileDirs ...string) *WSServer {
 	return &WSServer{
 		sm:             sm,
 		clients:        make(map[*websocket.Conn]bool),
+		connLocks:      make(map[*websocket.Conn]*sync.Mutex),
 		fileServerDirs: fileDirs,
 	}
 }
@@ -98,7 +106,7 @@ func (ws *WSServer) ServeFile(w http.ResponseWriter, r *http.Request) {
 	copy(dirs, ws.fileServerDirs)
 	ws.mu.Unlock()
 
-	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/files/"), "/", 2)
+	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, fileServePrefix), "/", 2)
 	if len(parts) < 2 {
 		http.NotFound(w, r)
 		return
@@ -131,8 +139,8 @@ func (ws *WSServer) Start() error {
 	ws.port = listener.Addr().(*net.TCPAddr).Port
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", ws.ServeWS)
-	mux.HandleFunc("/files/", ws.ServeFile)
+	mux.HandleFunc(wsRoute, ws.ServeWS)
+	mux.HandleFunc(fileServePrefix, ws.ServeFile)
 	// Custom routes registered by the application layer
 	for _, r := range ws.routes {
 		mux.HandleFunc(r.pattern, r.handler)
@@ -167,6 +175,8 @@ func (ws *WSServer) WriteJSON(c *websocket.Conn, msg StreamMessage) error {
 
 // Broadcast sends a JSON message to all connected clients.
 // data can be any JSON-serializable value; it will be marshaled internally.
+// 客户端列表在锁内快照，随后每连接独立 goroutine 写入：
+// 慢客户端不再阻塞其他客户端，也不占用 ws.mu（避免阻塞新连接注册/断开清理）。
 func (ws *WSServer) Broadcast(data any) {
 	raw, err := json.Marshal(data)
 	if err != nil {
@@ -174,17 +184,43 @@ func (ws *WSServer) Broadcast(data any) {
 		return
 	}
 	ws.mu.Lock()
-	defer ws.mu.Unlock()
+	clients := make([]*websocket.Conn, 0, len(ws.clients))
 	for c := range ws.clients {
-		_ = ws.writeJSON(c, raw)
+		clients = append(clients, c)
+	}
+	ws.mu.Unlock()
+
+	// coder/websocket 的 Conn 支持并发写，各连接独立 goroutine 互不影响
+	for _, c := range clients {
+		go func(conn *websocket.Conn) {
+			if err := ws.writeJSON(conn, raw); err != nil {
+				log.Printf("[WS] broadcast write error: %v", err)
+			}
+		}(c)
 	}
 }
 
 // writeJSON sends JSON-encoded bytes to a WebSocket connection.
+// coder/websocket 连接不支持并发 Write（并发写会帧交错，导致对端 JSON.parse 失败、消息丢失），
+// 而流消息（startStream/resumeStream）与 Broadcast/应用层消息可能并发写同一连接 → 每连接串行化。
 func (ws *WSServer) writeJSON(c *websocket.Conn, data []byte) error {
+	ws.connWriteLock(c).Lock()
+	defer ws.connWriteLock(c).Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return c.Write(ctx, websocket.MessageText, data)
+}
+
+// connWriteLock 返回连接的写锁（懒创建，连接断开清理后亦可安全重建）。
+func (ws *WSServer) connWriteLock(c *websocket.Conn) *sync.Mutex {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	mu, ok := ws.connLocks[c]
+	if !ok {
+		mu = &sync.Mutex{}
+		ws.connLocks[c] = mu
+	}
+	return mu
 }
 
 // handleWS handles the main WebSocket connection.
@@ -202,10 +238,12 @@ func (ws *WSServer) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	ws.mu.Lock()
 	ws.clients[c] = true
+	ws.connLocks[c] = &sync.Mutex{}
 	ws.mu.Unlock()
 	defer func() {
 		ws.mu.Lock()
 		delete(ws.clients, c)
+		delete(ws.connLocks, c)
 		ws.mu.Unlock()
 	}()
 
@@ -236,10 +274,10 @@ func (ws *WSServer) handleMessage(c *websocket.Conn, req *WsRequest) {
 	case "cancel":
 		ws.sm.CancelStream(req.StreamID)
 	case "approve_tool":
-		// ADK 原生 HITL 审批恢复：批准 → 以 FunctionResponse 恢复被暂停的工具
-		ws.startResumeStream(c, req, true)
+		// ADK 原生 HITL 审批：记录决策，同批全部已决后统一恢复（一次提交多个确认响应）
+		ws.resolveApproval(c, req, true)
 	case "reject_tool":
-		ws.startResumeStream(c, req, false)
+		ws.resolveApproval(c, req, false)
 	case "questionnaire_answer":
 		ws.sm.ResolveQuestionnaire(req.QuestionnaireID, req.Text)
 	case "continue_response":
@@ -299,22 +337,40 @@ func (ws *WSServer) startStream(c *websocket.Conn, req *WsRequest, message strin
 	log.Printf("[WS] 流完成 (stream=%s)", streamID)
 }
 
-// startResumeStream 审批恢复流：以 FunctionResponse（adk_request_confirmation）恢复被暂停的工具。
-// 前端 approve_tool/reject_tool 消息携带 session_id 与 approval_id（= 确认 FC 的 ID）。
-func (ws *WSServer) startResumeStream(c *websocket.Conn, req *WsRequest, approved bool) {
+// resolveApproval 处理单个审批决策：记录到该 session 的待审批批次。
+// 同批全部已决后才启动统一恢复流（ADK 需一次响应所有确认才能并发执行全部工具，
+// 逐个恢复会导致剩余确认永远挂起、编排卡死）。
+func (ws *WSServer) resolveApproval(c *websocket.Conn, req *WsRequest, approved bool) {
 	if req.SessionID == "" || req.ApprovalID == "" {
 		ws.writeJSON(c, mustMarshal(StreamMessage{Type: "error", Error: "session_id and approval_id required for approval resume"}))
 		return
 	}
+	decisions, resume, ok := ws.sm.ResolveApproval(req.SessionID, req.ApprovalID, approved)
+	if !ok {
+		// 该审批不在当前批次（已恢复或已超时）
+		ws.writeJSON(c, mustMarshal(StreamMessage{Type: "error", Error: "审批请求不存在或已超时"}))
+		return
+	}
+	if !resume {
+		log.Printf("[WS] 审批 %s 已记录（approved=%v），同批尚有未决审批，等待全部通过后统一恢复", req.ApprovalID, approved)
+		return
+	}
+	log.Printf("[WS] 同批 %d 项审批全部已决，启动统一恢复流", len(decisions))
+	ws.startResumeStream(c, req.SessionID, decisions)
+}
 
-	streamID, msgCh, err := ws.sm.StartResumeStream(req.SessionID, req.ApprovalID, approved)
+// startResumeStream 审批恢复流：以 FunctionResponse（adk_request_confirmation）恢复被暂停的工具。
+// decisions 为同批全部已决审批，一次提交多个确认响应，ADK 并发执行所有被确认的工具。
+// 前端 approve_tool/reject_tool 消息携带 session_id 与 approval_id（= 确认 FC 的 ID）。
+func (ws *WSServer) startResumeStream(c *websocket.Conn, sessionID string, decisions []ApprovalDecision) {
+	streamID, msgCh, err := ws.sm.StartResumeStream(sessionID, decisions)
 	if err != nil {
 		ws.writeJSON(c, mustMarshal(StreamMessage{Type: "error", Error: err.Error()}))
 		return
 	}
 
 	// Send started event with sessionID（前端据此识别新一轮流）
-	ws.writeJSON(c, mustMarshal(StreamMessage{Type: "started", StreamID: streamID, SessionID: req.SessionID}))
+	ws.writeJSON(c, mustMarshal(StreamMessage{Type: "started", StreamID: streamID, SessionID: sessionID}))
 
 	for msg := range msgCh {
 		msg.StreamID = streamID

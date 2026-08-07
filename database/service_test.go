@@ -18,7 +18,10 @@ func newTestDBService(t *testing.T) *DBService {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	svc := NewDBService(dir, "hhycode.db")
+	svc, err := NewDBService(dir, "hhycode.db")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if svc.db == nil {
 		t.Fatal("db not initialized")
 	}

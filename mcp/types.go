@@ -4,7 +4,6 @@ type TransportType string
 
 const (
 	TransportStdio TransportType = "stdio"
-	TransportSSE   TransportType = "sse"
 )
 
 type ServerStatus string

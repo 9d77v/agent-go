@@ -34,9 +34,6 @@ type AdkRunnerConfig struct {
 	// ArtifactService 制品存储服务（可选）。配置后启用输入 blob（图片等）→ artifact 机制（SaveInputBlobsAsArtifacts）。
 	ArtifactService artifact.Service
 
-	// MemoryService 记忆服务（可选）。
-	MemoryService any
-
 	// MaxIterations 最大迭代次数限制（0 表示不限制）。
 	MaxIterations int
 
@@ -85,6 +82,9 @@ func NewAdkRunner(cfg AdkRunnerConfig) (*AdkRunner, error) {
 	}, nil
 }
 
+// confirmationPlaceholder 确认等待中的占位结果文本（HITL）。
+const confirmationPlaceholder = "requires confirmation"
+
 // Run 运行 Agent 对话（文本输入），将 ADK Event 流转换为 OrchestratorCallbacks 回调。
 func (r *AdkRunner) Run(
 	ctx context.Context,
@@ -116,38 +116,22 @@ func (r *AdkRunner) runContent(
 	content *genai.Content,
 	callbacks *OrchestratorCallbacks,
 ) error {
-	// 生成消息 ID 和回合 ID
 	msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
 	turnID := fmt.Sprintf("turn_%d", time.Now().UnixNano())
-	seq := int64(0)
+	st := newRunState(callbacks, r.config.StreamingMode == adkagent.StreamingModeSSE, msgID, turnID)
 
 	// 通知消息开始
 	if callbacks.OnMessageStart != nil {
-		callbacks.OnMessageStart(msgID, seq, turnID, "model")
+		callbacks.OnMessageStart(st.msgID, 0, turnID, "model")
 	}
 
 	events := r.runner.Run(ctx, userID, sessionID, content, adkagent.RunConfig{
 		StreamingMode: r.config.StreamingMode,
 	})
 
-	var totalContent strings.Builder
-	iterCount := 0
-	hasError := false
-	msgHasModelParts := false
-	// 流式去重：partial（增量块）与 final（聚合事件）会携带相同的 FC / 审批确认事件，
-	// 记录已上报的 callID / approvalID，避免前端重复渲染。
-	emittedCalls := make(map[string]bool)
-	emittedApprovals := make(map[string]bool)
-	// 流式模式标志：final（聚合）事件的文本/思考跳过（partial 增量已逐块转发），
-	// 非流式模式所有事件都转发。
-	isStreaming := r.config.StreamingMode == adkagent.StreamingModeSSE
-
 	for event, err := range events {
 		if err != nil {
-			hasError = true
-			if callbacks.OnError != nil {
-				callbacks.OnError(msgID, "event_error", err.Error())
-			}
+			st.setError("event_error", err.Error())
 			continue
 		}
 
@@ -159,12 +143,9 @@ func (r *AdkRunner) runContent(
 		// MaxIterations 只统计 non-partial 事件：流式下每个 chunk 都是 partial，
 		// 若按事件数计数会被增量块撑爆提前截断（默认 50）。
 		if !isPartial {
-			iterCount++
-			if r.config.MaxIterations > 0 && iterCount > r.config.MaxIterations {
-				hasError = true
-				if callbacks.OnError != nil {
-					callbacks.OnError(msgID, "max_iterations", "达到最大迭代次数限制")
-				}
+			st.iterCount++
+			if r.config.MaxIterations > 0 && st.iterCount > r.config.MaxIterations {
+				st.setError("max_iterations", "达到最大迭代次数限制")
 				break
 			}
 		}
@@ -173,194 +154,271 @@ func (r *AdkRunner) runContent(
 			continue
 		}
 
-		// 判断该事件是否为"模型响应"（含思考/文本/函数调用）；工具结果事件不含这些。
-		// adk_request_confirmation 确认事件不视为模型响应（不拆新消息，避免空气泡）。
-		isModelEvent := false
-		for _, part := range event.Content.Parts {
-			if part == nil {
-				continue
-			}
-			if part.Text != "" || (part.FunctionCall != nil && part.FunctionCall.Name != adktoolconfirmation.FunctionCallName) {
-				isModelEvent = true
-				break
-			}
-		}
-
 		// 按子响应拆分消息：每个新的模型响应开启一条新消息，
 		// 与历史消息（每条 = 一段思考 + 若干工具调用）保持一致。
 		// 工具结果事件不拆分，归入发起该调用所在子响应的消息。
 		// 仅 non-partial 事件参与拆分（partial 增量块属于当前消息）。
-		if !isPartial && isModelEvent && msgHasModelParts {
-			if callbacks.OnMessageEnd != nil {
-				callbacks.OnMessageEnd(msgID)
+		if isModelEvent(event.Content) {
+			if !isPartial && st.msgHasModelParts {
+				st.startNextMessage()
 			}
-			seq++
-			msgID = fmt.Sprintf("msg_%d_%d", time.Now().UnixNano(), seq)
-			if callbacks.OnMessageStart != nil {
-				callbacks.OnMessageStart(msgID, seq, turnID, "model")
+			if !isPartial {
+				st.msgHasModelParts = true
 			}
-		}
-		if !isPartial && isModelEvent {
-			msgHasModelParts = true
 		}
 
 		// 处理 Content Parts
 		for _, part := range event.Content.Parts {
-			// 文本/思考：流式模式下只转发 partial 增量块；final（聚合）事件含完整文本
-			//（与增量块重复），跳过避免前端重复渲染。非流式模式所有事件都转发。
-			if part.Text != "" && isStreaming && !isPartial {
-				continue
-			}
-			// 思考/推理内容
-			if part.Text != "" && part.Thought && callbacks.OnReasoningDelta != nil {
-				callbacks.OnReasoningDelta(msgID, part.Text)
-			} else if part.Text != "" && !part.Thought {
-				totalContent.WriteString(part.Text)
-				if callbacks.OnContentDelta != nil {
-					callbacks.OnContentDelta(msgID, part.Text)
-				}
-			}
-
-			// FunctionCall（工具调用）
-			if part.FunctionCall != nil {
-				// ADK 原生 HITL：识别 adk_request_confirmation 事件 → 触发审批请求（approvalID=确认 FC 的 ID）
-				if part.FunctionCall.Name == adktoolconfirmation.FunctionCallName {
-					// 流式下 partial 与 final 各出现一次确认 FC，去重避免重复触发审批
-					if emittedApprovals[part.FunctionCall.ID] {
-						continue
-					}
-					emittedApprovals[part.FunctionCall.ID] = true
-					if callbacks.OnApprovalRequired != nil {
-						approvalID := part.FunctionCall.ID
-						origCallID := approvalID
-						command := ""
-						risk := ftool.RiskDangerous
-						if orig, err := adktoolconfirmation.OriginalCallFrom(part.FunctionCall); err == nil && orig != nil {
-							origCallID = orig.ID
-							// 命令工具只展示实际命令，不暴露内部参数（command/goal/explanation 等）
-							if orig.Name == "run_command" {
-								if cmd, ok := orig.Args["command"].(string); ok {
-									command = cmd
-								}
-							} else if orig.Args != nil {
-								if b, jerr := json.Marshal(orig.Args); jerr == nil {
-									command = fmt.Sprintf("%s %s", orig.Name, string(b))
-								} else {
-									command = fmt.Sprintf("%s %v", orig.Name, orig.Args)
-								}
-							} else {
-								command = orig.Name
-							}
-						}
-						// 从 toolConfirmation 提取 hint 与 payload（含 risk）
-						if tc, ok := part.FunctionCall.Args["toolConfirmation"].(map[string]any); ok {
-							if p, ok := tc["payload"].(map[string]any); ok {
-								if r, ok := p["risk"].(string); ok && r != "" {
-									risk = ftool.RiskLevel(r)
-								}
-							}
-						}
-						log.Printf("[ADK] 识别确认事件 → approval_required approvalID=%s callID=%s risk=%s cmd=%q", approvalID, origCallID, risk, command)
-						callbacks.OnApprovalRequired(approvalID, origCallID, command, risk)
-					} else {
-						log.Printf("[ADK] 识别确认事件但 OnApprovalRequired 未注册（approvalID=%s）", part.FunctionCall.ID)
-					}
-					// 不当作普通工具调用上报
-					continue
-				}
-
-				callID := part.FunctionCall.ID
-				if callID == "" {
-					callID = fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, time.Now().UnixNano())
-				}
-				// 流式下去重：partial 先到并转发，final 聚合事件重复时跳过
-				if emittedCalls[callID] {
-					continue
-				}
-				emittedCalls[callID] = true
-				name := part.FunctionCall.Name
-				argsJSON := part.FunctionCall.Args
-
-				if callbacks.OnToolCallStart != nil {
-					callbacks.OnToolCallStart(msgID, callID, name)
-				}
-				// ADK 一次性给全 args，直接发送完整结果
-				if callbacks.OnToolCallEnd != nil {
-					argsStr := ""
-					if argsJSON != nil {
-						if b, jerr := json.Marshal(argsJSON); jerr == nil {
-							argsStr = string(b)
-						} else {
-							argsStr = fmt.Sprintf("%v", argsJSON)
-						}
-					}
-					callbacks.OnToolCallEnd(callID, name, argsStr)
-				}
-			}
-
-			// FunctionResponse（工具执行结果）
-			if part.FunctionResponse != nil {
-				// 流式下 FR 恒为 final 事件；partial 增量块不含 FR，防御性跳过
-				if isPartial {
-					continue
-				}
-				callID := part.FunctionResponse.ID
-				name := part.FunctionResponse.Name
-				respStr := fmt.Sprintf("%v", part.FunctionResponse.Response)
-				// 跳过 HITL 占位 FR（确认等待中的占位结果，含 "requires confirmation"），避免误报为真实工具结果
-				if strings.Contains(respStr, "requires confirmation") {
-					continue
-				}
-				result := &ftool.ToolResult{
-					Success: true,
-					Output:  respStr,
-				}
-				// 工具返回错误（如审批被拒绝 call is rejected）→ 标记失败，前端据此显示 error 状态
-				if respMap := part.FunctionResponse.Response; respMap != nil {
-					if errStr, ok := respMap["error"].(string); ok && errStr != "" {
-						result.Success = false
-						result.Error = errStr
-						result.Output = errStr
-					}
-				}
-				log.Printf("[ADK] tool_result callID=%s name=%s success=%v output=%q", callID, name, result.Success, result.Output)
-
-				if callbacks.OnToolExecuting != nil {
-					callbacks.OnToolExecuting(callID, name)
-				}
-				toolMsgID := fmt.Sprintf("tool_%s_%d", callID, time.Now().UnixNano())
-				if callbacks.OnToolResult != nil {
-					callbacks.OnToolResult(callID, toolMsgID, result)
-				}
-				// 工具结果事件不拆分消息，归入发起该调用所在子响应的消息。
-			}
+			st.handlePart(part, isPartial)
 		}
 
 		// Token 用量：仅 non-partial（final 聚合事件携带完整 usage；partial 无）
-		if !isPartial && event.UsageMetadata != nil && callbacks.OnTokenUsage != nil {
-			callbacks.OnTokenUsage(ftool.TokenUsageInfo{
-				PromptTokens:     int(event.UsageMetadata.PromptTokenCount),
-				CompletionTokens: int(event.UsageMetadata.CandidatesTokenCount),
-				TotalTokens:      int(event.UsageMetadata.TotalTokenCount),
-				CachedTokens:     int(event.UsageMetadata.CachedContentTokenCount),
-			})
+		if !isPartial && event.UsageMetadata != nil {
+			st.handleTokenUsage(event.UsageMetadata)
 		}
 
 		// 错误处理
-		if event.ErrorCode != "" && callbacks.OnError != nil {
-			callbacks.OnError(msgID, event.ErrorCode, event.ErrorMessage)
+		if event.ErrorCode != "" {
+			st.setError(event.ErrorCode, event.ErrorMessage)
 		}
 	}
 
 	// 通知消息结束
 	if callbacks.OnMessageEnd != nil {
-		callbacks.OnMessageEnd(msgID)
+		callbacks.OnMessageEnd(st.msgID)
 	}
 
 	// 回合完成
-	if callbacks.OnTurnComplete != nil && !hasError {
+	if callbacks.OnTurnComplete != nil && !st.hasError {
 		callbacks.OnTurnComplete(turnID, sessionID)
 	}
 
+	// 运行失败：返回错误供调用方感知（错误已通过 OnError 回调精确上报）
+	if st.hasError {
+		return st.lastErr
+	}
 	return nil
+}
+
+// runState 单次 runContent 的共享状态，供各事件处理子方法使用。
+type runState struct {
+	callbacks        *OrchestratorCallbacks
+	isStreaming      bool
+	msgID            string
+	turnID           string
+	seq              int64
+	msgHasModelParts bool
+	iterCount        int
+	hasError         bool
+	lastErr          error
+	totalContent     strings.Builder
+	emittedCalls     map[string]bool
+	emittedApprovals map[string]bool
+}
+
+func newRunState(callbacks *OrchestratorCallbacks, isStreaming bool, msgID, turnID string) *runState {
+	return &runState{
+		callbacks:        callbacks,
+		isStreaming:      isStreaming,
+		msgID:            msgID,
+		turnID:           turnID,
+		emittedCalls:     make(map[string]bool),
+		emittedApprovals: make(map[string]bool),
+	}
+}
+
+// setError 记录错误（含消息），并通过 callbacks.OnError 上报。
+func (s *runState) setError(code, message string) {
+	s.hasError = true
+	s.lastErr = fmt.Errorf("%s: %s", code, message)
+	if s.callbacks.OnError != nil {
+		s.callbacks.OnError(s.msgID, code, message)
+	}
+}
+
+// isModelEvent 判断事件是否为"模型响应"（含思考/文本/函数调用；工具结果与确认事件不算）。
+// adk_request_confirmation 确认事件不视为模型响应（不拆新消息，避免空气泡）。
+func isModelEvent(content *genai.Content) bool {
+	for _, part := range content.Parts {
+		if part == nil {
+			continue
+		}
+		if part.Text != "" || (part.FunctionCall != nil && part.FunctionCall.Name != adktoolconfirmation.FunctionCallName) {
+			return true
+		}
+	}
+	return false
+}
+
+// startNextMessage 结束当前消息并开启下一条（子响应拆分）。
+func (s *runState) startNextMessage() {
+	if s.callbacks.OnMessageEnd != nil {
+		s.callbacks.OnMessageEnd(s.msgID)
+	}
+	s.seq++
+	s.msgID = fmt.Sprintf("msg_%d_%d", time.Now().UnixNano(), s.seq)
+	if s.callbacks.OnMessageStart != nil {
+		s.callbacks.OnMessageStart(s.msgID, s.seq, s.turnID, "model")
+	}
+}
+
+// handlePart 处理单个 Content Part：文本/思考、FunctionCall（含审批）、FunctionResponse。
+func (s *runState) handlePart(part *genai.Part, isPartial bool) {
+	if part == nil {
+		return
+	}
+
+	// 文本/思考：流式模式下只转发 partial 增量块；final（聚合）事件含完整文本
+	//（与增量块重复），跳过避免前端重复渲染。非流式模式所有事件都转发。
+	if part.Text != "" {
+		if s.isStreaming && !isPartial {
+			return
+		}
+		if part.Thought && s.callbacks.OnReasoningDelta != nil {
+			s.callbacks.OnReasoningDelta(s.msgID, part.Text)
+		} else if !part.Thought {
+			s.totalContent.WriteString(part.Text)
+			if s.callbacks.OnContentDelta != nil {
+				s.callbacks.OnContentDelta(s.msgID, part.Text)
+			}
+		}
+	}
+
+	// FunctionCall（工具调用）
+	if part.FunctionCall != nil {
+		// ADK 原生 HITL：识别 adk_request_confirmation 事件 → 触发审批请求（approvalID=确认 FC 的 ID）
+		if part.FunctionCall.Name == adktoolconfirmation.FunctionCallName {
+			s.handleApproval(part.FunctionCall)
+			return
+		}
+		s.handleFunctionCall(part.FunctionCall)
+	}
+
+	// FunctionResponse（工具执行结果）
+	if part.FunctionResponse != nil {
+		// 流式下 FR 恒为 final 事件；partial 增量块不含 FR，防御性跳过
+		if isPartial {
+			return
+		}
+		s.handleFunctionResponse(part.FunctionResponse)
+	}
+}
+
+// handleApproval 处理 adk_request_confirmation 确认事件 → 触发审批请求。
+// 流式下 partial 与 final 各出现一次确认 FC，去重避免重复触发审批。
+func (s *runState) handleApproval(fc *genai.FunctionCall) {
+	if s.emittedApprovals[fc.ID] {
+		return
+	}
+	s.emittedApprovals[fc.ID] = true
+
+	if s.callbacks.OnApprovalRequired == nil {
+		log.Printf("[ADK] 识别确认事件但 OnApprovalRequired 未注册（approvalID=%s）", fc.ID)
+		return
+	}
+
+	approvalID := fc.ID
+	origCallID := approvalID
+	command := ""
+	risk := ftool.RiskDangerous
+	if orig, err := adktoolconfirmation.OriginalCallFrom(fc); err == nil && orig != nil {
+		origCallID = orig.ID
+		// 命令工具只展示实际命令，不暴露内部参数（command/goal/explanation 等）
+		if orig.Name == "run_command" {
+			if cmd, ok := orig.Args["command"].(string); ok {
+				command = cmd
+			}
+		} else if orig.Args != nil {
+			if b, jerr := json.Marshal(orig.Args); jerr == nil {
+				command = fmt.Sprintf("%s %s", orig.Name, string(b))
+			} else {
+				command = fmt.Sprintf("%s %v", orig.Name, orig.Args)
+			}
+		} else {
+			command = orig.Name
+		}
+	}
+	// 从 toolConfirmation 提取 hint 与 payload（含 risk）
+	if tc, ok := fc.Args["toolConfirmation"].(map[string]any); ok {
+		if p, ok := tc["payload"].(map[string]any); ok {
+			if r, ok := p["risk"].(string); ok && r != "" {
+				risk = ftool.RiskLevel(r)
+			}
+		}
+	}
+	log.Printf("[ADK] 识别确认事件 → approval_required approvalID=%s callID=%s risk=%s cmd=%q", approvalID, origCallID, risk, command)
+	s.callbacks.OnApprovalRequired(approvalID, origCallID, command, risk)
+}
+
+// handleFunctionCall 上报工具调用（流式去重：partial 先到并转发，final 聚合事件重复时跳过）。
+func (s *runState) handleFunctionCall(fc *genai.FunctionCall) {
+	callID := fc.ID
+	if callID == "" {
+		callID = fmt.Sprintf("call_%s_%d", fc.Name, time.Now().UnixNano())
+	}
+	if s.emittedCalls[callID] {
+		return
+	}
+	s.emittedCalls[callID] = true
+
+	if s.callbacks.OnToolCallStart != nil {
+		s.callbacks.OnToolCallStart(s.msgID, callID, fc.Name)
+	}
+	// ADK 一次性给全 args，直接发送完整结果
+	if s.callbacks.OnToolCallEnd != nil {
+		argsStr := ""
+		if fc.Args != nil {
+			if b, jerr := json.Marshal(fc.Args); jerr == nil {
+				argsStr = string(b)
+			} else {
+				argsStr = fmt.Sprintf("%v", fc.Args)
+			}
+		}
+		s.callbacks.OnToolCallEnd(callID, fc.Name, argsStr)
+	}
+}
+
+// handleFunctionResponse 上报工具执行结果。
+func (s *runState) handleFunctionResponse(fr *genai.FunctionResponse) {
+	callID := fr.ID
+	name := fr.Name
+	respStr := fmt.Sprintf("%v", fr.Response)
+	// 跳过 HITL 占位 FR（确认等待中的占位结果，含 "requires confirmation"），避免误报为真实工具结果
+	if strings.Contains(respStr, confirmationPlaceholder) {
+		return
+	}
+	result := &ftool.ToolResult{
+		Success: true,
+		Output:  respStr,
+	}
+	// 工具返回错误（如审批被拒绝 call is rejected）→ 标记失败，前端据此显示 error 状态
+	if respMap := fr.Response; respMap != nil {
+		if errStr, ok := respMap["error"].(string); ok && errStr != "" {
+			result.Success = false
+			result.Error = errStr
+			result.Output = errStr
+		}
+	}
+	log.Printf("[ADK] tool_result callID=%s name=%s success=%v output=%q", callID, name, result.Success, result.Output)
+
+	if s.callbacks.OnToolExecuting != nil {
+		s.callbacks.OnToolExecuting(callID, name)
+	}
+	toolMsgID := fmt.Sprintf("tool_%s_%d", callID, time.Now().UnixNano())
+	if s.callbacks.OnToolResult != nil {
+		s.callbacks.OnToolResult(callID, toolMsgID, result)
+	}
+}
+
+// handleTokenUsage 上报 token 用量。
+func (s *runState) handleTokenUsage(usage *genai.GenerateContentResponseUsageMetadata) {
+	if s.callbacks.OnTokenUsage == nil {
+		return
+	}
+	s.callbacks.OnTokenUsage(ftool.TokenUsageInfo{
+		PromptTokens:     int(usage.PromptTokenCount),
+		CompletionTokens: int(usage.CandidatesTokenCount),
+		TotalTokens:      int(usage.TotalTokenCount),
+		CachedTokens:     int(usage.CachedContentTokenCount),
+	})
 }
