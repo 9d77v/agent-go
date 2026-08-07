@@ -39,6 +39,10 @@ type AdkRunnerConfig struct {
 
 	// MaxIterations 最大迭代次数限制（0 表示不限制）。
 	MaxIterations int
+
+	// StreamingMode 流式模式（默认 StreamingModeSSE，全局强制流式输出）。
+	// 作为内部扩展点：未来如需按供应商关闭流式，可在此注入配置。
+	StreamingMode adkagent.StreamingMode
 }
 
 // AdkRunner 封装 ADK-Go Runner，将 Event 流转换为 OrchestratorCallbacks。
@@ -57,6 +61,11 @@ func NewAdkRunner(cfg AdkRunnerConfig) (*AdkRunner, error) {
 	}
 	if cfg.SessionService == nil {
 		return nil, fmt.Errorf("SessionService is required")
+	}
+
+	// 默认 SSE 流式（全局强制）；空值回退到非流式以保持向后兼容。
+	if cfg.StreamingMode == "" {
+		cfg.StreamingMode = adkagent.StreamingModeSSE
 	}
 
 	r, err := runner.New(runner.Config{
@@ -117,12 +126,21 @@ func (r *AdkRunner) runContent(
 		callbacks.OnMessageStart(msgID, seq, turnID, "model")
 	}
 
-	events := r.runner.Run(ctx, userID, sessionID, content, adkagent.RunConfig{})
+	events := r.runner.Run(ctx, userID, sessionID, content, adkagent.RunConfig{
+		StreamingMode: r.config.StreamingMode,
+	})
 
 	var totalContent strings.Builder
 	iterCount := 0
 	hasError := false
 	msgHasModelParts := false
+	// 流式去重：partial（增量块）与 final（聚合事件）会携带相同的 FC / 审批确认事件，
+	// 记录已上报的 callID / approvalID，避免前端重复渲染。
+	emittedCalls := make(map[string]bool)
+	emittedApprovals := make(map[string]bool)
+	// 流式模式标志：final（聚合）事件的文本/思考跳过（partial 增量已逐块转发），
+	// 非流式模式所有事件都转发。
+	isStreaming := r.config.StreamingMode == adkagent.StreamingModeSSE
 
 	for event, err := range events {
 		if err != nil {
@@ -133,13 +151,22 @@ func (r *AdkRunner) runContent(
 			continue
 		}
 
-		iterCount++
-		if r.config.MaxIterations > 0 && iterCount > r.config.MaxIterations {
-			hasError = true
-			if callbacks.OnError != nil {
-				callbacks.OnError(msgID, "max_iterations", "达到最大迭代次数限制")
+		// 流式模式下 partial 事件是逐块增量（文本/思考/FC），仅用于前端展示，
+		// 不参与迭代计数、消息拆分、工具结果与 token 用量处理。
+		// final（聚合）事件与非流式事件一一对应 → 迭代计数语义完全一致。
+		isPartial := event.LLMResponse.Partial
+
+		// MaxIterations 只统计 non-partial 事件：流式下每个 chunk 都是 partial，
+		// 若按事件数计数会被增量块撑爆提前截断（默认 50）。
+		if !isPartial {
+			iterCount++
+			if r.config.MaxIterations > 0 && iterCount > r.config.MaxIterations {
+				hasError = true
+				if callbacks.OnError != nil {
+					callbacks.OnError(msgID, "max_iterations", "达到最大迭代次数限制")
+				}
+				break
 			}
-			break
 		}
 
 		if event.Content == nil {
@@ -162,7 +189,8 @@ func (r *AdkRunner) runContent(
 		// 按子响应拆分消息：每个新的模型响应开启一条新消息，
 		// 与历史消息（每条 = 一段思考 + 若干工具调用）保持一致。
 		// 工具结果事件不拆分，归入发起该调用所在子响应的消息。
-		if isModelEvent && msgHasModelParts {
+		// 仅 non-partial 事件参与拆分（partial 增量块属于当前消息）。
+		if !isPartial && isModelEvent && msgHasModelParts {
 			if callbacks.OnMessageEnd != nil {
 				callbacks.OnMessageEnd(msgID)
 			}
@@ -172,12 +200,17 @@ func (r *AdkRunner) runContent(
 				callbacks.OnMessageStart(msgID, seq, turnID, "model")
 			}
 		}
-		if isModelEvent {
+		if !isPartial && isModelEvent {
 			msgHasModelParts = true
 		}
 
 		// 处理 Content Parts
 		for _, part := range event.Content.Parts {
+			// 文本/思考：流式模式下只转发 partial 增量块；final（聚合）事件含完整文本
+			//（与增量块重复），跳过避免前端重复渲染。非流式模式所有事件都转发。
+			if part.Text != "" && isStreaming && !isPartial {
+				continue
+			}
 			// 思考/推理内容
 			if part.Text != "" && part.Thought && callbacks.OnReasoningDelta != nil {
 				callbacks.OnReasoningDelta(msgID, part.Text)
@@ -192,6 +225,11 @@ func (r *AdkRunner) runContent(
 			if part.FunctionCall != nil {
 				// ADK 原生 HITL：识别 adk_request_confirmation 事件 → 触发审批请求（approvalID=确认 FC 的 ID）
 				if part.FunctionCall.Name == adktoolconfirmation.FunctionCallName {
+					// 流式下 partial 与 final 各出现一次确认 FC，去重避免重复触发审批
+					if emittedApprovals[part.FunctionCall.ID] {
+						continue
+					}
+					emittedApprovals[part.FunctionCall.ID] = true
 					if callbacks.OnApprovalRequired != nil {
 						approvalID := part.FunctionCall.ID
 						origCallID := approvalID
@@ -235,6 +273,11 @@ func (r *AdkRunner) runContent(
 				if callID == "" {
 					callID = fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, time.Now().UnixNano())
 				}
+				// 流式下去重：partial 先到并转发，final 聚合事件重复时跳过
+				if emittedCalls[callID] {
+					continue
+				}
+				emittedCalls[callID] = true
 				name := part.FunctionCall.Name
 				argsJSON := part.FunctionCall.Args
 
@@ -257,6 +300,10 @@ func (r *AdkRunner) runContent(
 
 			// FunctionResponse（工具执行结果）
 			if part.FunctionResponse != nil {
+				// 流式下 FR 恒为 final 事件；partial 增量块不含 FR，防御性跳过
+				if isPartial {
+					continue
+				}
 				callID := part.FunctionResponse.ID
 				name := part.FunctionResponse.Name
 				respStr := fmt.Sprintf("%v", part.FunctionResponse.Response)
@@ -289,12 +336,13 @@ func (r *AdkRunner) runContent(
 			}
 		}
 
-		// Token 用量
-		if event.UsageMetadata != nil && callbacks.OnTokenUsage != nil {
+		// Token 用量：仅 non-partial（final 聚合事件携带完整 usage；partial 无）
+		if !isPartial && event.UsageMetadata != nil && callbacks.OnTokenUsage != nil {
 			callbacks.OnTokenUsage(ftool.TokenUsageInfo{
 				PromptTokens:     int(event.UsageMetadata.PromptTokenCount),
 				CompletionTokens: int(event.UsageMetadata.CandidatesTokenCount),
 				TotalTokens:      int(event.UsageMetadata.TotalTokenCount),
+				CachedTokens:     int(event.UsageMetadata.CachedContentTokenCount),
 			})
 		}
 

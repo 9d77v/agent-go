@@ -12,6 +12,7 @@ type AccumulatedTokens struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
+	CachedTokens     int
 }
 
 // WrapTokenUsageCallbacks 包装 OrchestratorCallbacks，自动累积 token 用量
@@ -35,6 +36,7 @@ func WrapTokenUsageCallbacks(callbacks *OrchestratorCallbacks, saveFn func(token
 			"prompt_tokens":     accumulatedTokens.PromptTokens,
 			"completion_tokens": accumulatedTokens.CompletionTokens,
 			"total_tokens":      accumulatedTokens.TotalTokens,
+			"cached_tokens":     accumulatedTokens.CachedTokens,
 		})
 		saveFn(string(tuJSON))
 	}
@@ -45,6 +47,7 @@ func WrapTokenUsageCallbacks(callbacks *OrchestratorCallbacks, saveFn func(token
 		accumulatedTokens.PromptTokens = tu.PromptTokens
 		accumulatedTokens.CompletionTokens = tu.CompletionTokens
 		accumulatedTokens.TotalTokens = tu.TotalTokens
+		accumulatedTokens.CachedTokens = tu.CachedTokens
 		tokenMu.Unlock()
 		// 实时持久化：即使运行中途被打断（max_iterations/取消/错误），token 用量也已写入数据库。
 		saveCurrent()

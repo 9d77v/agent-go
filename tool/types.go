@@ -78,7 +78,15 @@ type TokenUsageInfo struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
-	ContextWindow    int `json:"context_window"`
+	CachedTokens     int `json:"cached_tokens,omitempty"`
+	ContextWindow    int `json:"context_window,omitempty"`
+
+	// ── 上下文窗口细分（应用层在编排时估算填充，供前端 VSCode 式占比展示）──
+	ReservedTokens    int `json:"reserved_tokens,omitempty"`
+	SystemTokens      int `json:"system_tokens,omitempty"`
+	ToolsTokens       int `json:"tools_tokens,omitempty"`
+	MessagesTokens    int `json:"messages_tokens,omitempty"`
+	ToolResultsTokens int `json:"tool_results_tokens,omitempty"`
 }
 
 // ---------- 工具参数类型 ----------
